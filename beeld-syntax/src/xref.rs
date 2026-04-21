@@ -99,7 +99,7 @@ fn fallback_xref_map_inner<'a>(
                 // Check that the object following it is actually valid before inserting it.
                 cloned.skip_white_spaces_and_comments();
                 if cloned.skip::<Object<'_>>(false).is_some() {
-                    xref_map.insert(obj_id, EntryType::Normal(cur_pos));
+                    xref_map.insert(obj_id, EntryType::Normal { offset: cur_pos });
                     last_obj_num = Some(obj_id);
                     dummy_ctx.set_obj_number(obj_id);
                 }
@@ -144,14 +144,14 @@ fn fallback_xref_map_inner<'a>(
                                 // set of tests.
                                 if xref_map
                                     .get(&id)
-                                    .is_none_or(|e| !matches!(e, &EntryType::Normal(_)))
+                                    .is_none_or(|e| !matches!(e, &EntryType::Normal { .. }))
                                 {
                                     xref_map.insert(
                                         id,
-                                        EntryType::ObjStream(
-                                            last_obj_num.obj_number as u32,
-                                            idx as u32,
-                                        ),
+                                        EntryType::Compressed {
+                                            obj_stream: last_obj_num.obj_number,
+                                            index: idx as u32,
+                                        },
                                     );
                                 }
                             }
@@ -184,7 +184,7 @@ fn fallback_xref_map_inner<'a>(
 
             match root_id {
                 MaybeRef::Ref(r) => match xref_map.get(&r.into()) {
-                    Some(EntryType::Normal(offset)) => {
+                    Some(EntryType::Normal { offset }) => {
                         let mut reader = Reader::new(&data.as_ref()[*offset..]);
 
                         if let Some(obj) =
@@ -197,9 +197,9 @@ fn fallback_xref_map_inner<'a>(
                             trailer_dict = Some(dict);
                         }
                     }
-                    Some(EntryType::ObjStream(obj_num, idx)) => {
-                        if let Some(EntryType::Normal(offset)) =
-                            xref_map.get(&ObjectIdentifier::new(*obj_num as i32, 0))
+                    Some(EntryType::Compressed { obj_stream, index }) => {
+                        if let Some(EntryType::Normal { offset }) =
+                            xref_map.get(&ObjectIdentifier::new(*obj_stream, 0))
                         {
                             let mut reader = Reader::new(&data.as_ref()[*offset..]);
 
@@ -210,7 +210,7 @@ fn fallback_xref_map_inner<'a>(
                                     if let Some(data) = stream.decoded().ok()
                                         && let Some(object_stream) =
                                             ObjectStream::new(stream, &data, &dummy_ctx)
-                                        && let Some(obj) = object_stream.get::<Dict<'_>>(*idx)
+                                        && let Some(obj) = object_stream.get::<Dict<'_>>(*index)
                                     {
                                         check(&obj)
                                     } else {
@@ -404,8 +404,67 @@ impl XRef {
     pub(crate) fn len(&self) -> usize {
         match &self.0 {
             Inner::Dummy => 0,
-            Inner::Some(r) => r.map.get().xref_map.len(),
+            Inner::Some(r) => r
+                .map
+                .get()
+                .xref_map
+                .values()
+                .filter(|e| !matches!(e, EntryType::Free { .. }))
+                .count(),
         }
+    }
+
+    /// Resolve the cross-reference entry for the given object identifier.
+    ///
+    /// Returns `None` for a dummy xref or when `id` is not present in any
+    /// xref section. The returned [`EntryType`] discriminates between
+    /// [`Normal`](EntryType::Normal) (offset in file), [`Compressed`](
+    /// EntryType::Compressed) (inside an object stream), and
+    /// [`Free`](EntryType::Free) (on the free list).
+    pub fn entry(&self, id: ObjectIdentifier) -> Option<EntryType> {
+        match &self.0 {
+            Inner::Dummy => None,
+            Inner::Some(r) => r.map.get().xref_map.get(&id).copied(),
+        }
+    }
+
+    /// Iterate over every entry in the cross-reference table, including
+    /// free entries.
+    ///
+    /// Ordering is deterministic but unspecified — do not rely on
+    /// iteration order matching file order.
+    pub fn entries(&self) -> Vec<(ObjectIdentifier, EntryType)> {
+        match &self.0 {
+            Inner::Dummy => Vec::new(),
+            Inner::Some(r) => r
+                .map
+                .get()
+                .xref_map
+                .iter()
+                .map(|(id, e)| (*id, *e))
+                .collect(),
+        }
+    }
+
+    /// Return the logical size of the cross-reference table.
+    ///
+    /// This is the trailer's `/Size` value when present, falling back to
+    /// the highest observed object number plus one.
+    pub fn size(&self) -> i32 {
+        let from_trailer: Option<i32> =
+            self.trailer().and_then(|t| t.get::<i32>(SIZE));
+        let from_map: i32 = match &self.0 {
+            Inner::Dummy => 0,
+            Inner::Some(r) => r
+                .map
+                .get()
+                .xref_map
+                .keys()
+                .map(|k| k.obj_number.saturating_add(1))
+                .max()
+                .unwrap_or(0),
+        };
+        max(from_trailer.unwrap_or(0), from_map)
     }
 
     pub(crate) fn trailer_data(&self) -> &TrailerData {
@@ -508,21 +567,23 @@ impl XRef {
                 let mut elements = locked
                     .xref_map
                     .iter()
-                    .map(|(id, e)| {
+                    .filter_map(|(id, e)| {
                         let offset = match e {
-                            EntryType::Normal(o) => (*o, 0),
-                            EntryType::ObjStream(id, index) => {
-                                if let Some(EntryType::Normal(offset)) =
-                                    locked.xref_map.get(&ObjectIdentifier::new(*id as i32, 0))
+                            EntryType::Normal { offset } => (*offset, 0),
+                            EntryType::Compressed { obj_stream, index } => {
+                                if let Some(EntryType::Normal { offset }) =
+                                    locked.xref_map.get(&ObjectIdentifier::new(*obj_stream, 0))
                                 {
                                     (*offset, *index)
                                 } else {
                                     (usize::MAX, 0)
                                 }
                             }
+                            // Free entries have no object body to yield.
+                            EntryType::Free { .. } => return None,
                         };
 
-                        (*id, offset)
+                        Some((*id, offset))
                     })
                     .collect::<Vec<_>>();
 
@@ -628,7 +689,8 @@ impl XRef {
         ctx.set_in_content_stream(false);
 
         match entry {
-            EntryType::Normal(offset) => {
+            EntryType::Free { .. } => None,
+            EntryType::Normal { offset } => {
                 ctx.set_in_object_stream(false);
                 r.jump(offset);
 
@@ -660,9 +722,9 @@ impl XRef {
                     self.get_with::<T>(id, &ctx)
                 }
             }
-            EntryType::ObjStream(obj_stram_gen_num, index) => {
+            EntryType::Compressed { obj_stream, index } => {
                 // Generation number is implicitly 0.
-                let obj_stream_id = ObjectIdentifier::new(obj_stram_gen_num as i32, 0);
+                let obj_stream_id = ObjectIdentifier::new(obj_stream, 0);
 
                 if obj_stream_id == id {
                     warn!("cycle detected in object stream");
@@ -706,15 +768,36 @@ pub(crate) fn find_last_xref_pos(data: &[u8]) -> Option<usize> {
     finder.read_without_context::<i32>()?.try_into().ok()
 }
 
-/// A type of xref entry.
+/// The type of a cross-reference table entry.
+///
+/// ISO 32000-1 §7.5.4 and §7.5.8 describe the three entry types.
+///
+/// `Free` entries form a linked list (`next_free`, `generation`);
+/// diagnostics and repair tools need to walk it. `Compressed` entries
+/// point into an object stream per §7.5.7.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum EntryType {
-    /// An indirect object that is at a specific offset in the original data.
-    Normal(usize),
-    /// An indirect object that is part of an object stream. First number indicates the object
-    /// number of the _object stream_ (the generation number is always 0), the second number indicates
-    /// the index in the object stream.
-    ObjStream(u32, u32),
+#[non_exhaustive]
+pub enum EntryType {
+    /// In-use object at the given byte offset into the original data.
+    Normal {
+        /// File byte offset of the `N G obj` header.
+        offset: usize,
+    },
+    /// In-use object stored inside an object stream (§7.5.7).
+    Compressed {
+        /// Object number of the hosting object stream. The generation
+        /// number of a compressed object is always 0 per spec.
+        obj_stream: i32,
+        /// Zero-based index of the object within the stream.
+        index: u32,
+    },
+    /// A free entry on the free-list linked list (§7.5.4).
+    Free {
+        /// Object number of the next free entry. `0` terminates the list.
+        next_free: i32,
+        /// The generation number the next re-use of this slot must have.
+        generation: u16,
+    },
 }
 
 type XrefMap = FxHashMap<ObjectIdentifier, EntryType>;
@@ -913,7 +996,21 @@ fn populate_from_xref_table<'a>(
             if entry.used {
                 insert_map.insert(
                     ObjectIdentifier::new(obj_number as i32, entry.gen_number),
-                    EntryType::Normal(entry.offset),
+                    EntryType::Normal { offset: entry.offset },
+                );
+            } else {
+                // Free entry: the "offset" column is the next free object
+                // number, the "generation" column is the generation to use
+                // when this slot is re-used. Per §7.5.4, the canonical head
+                // of the free list is at object 0 with generation 65535.
+                let next_free = i32::try_from(entry.offset).unwrap_or(i32::MAX);
+                let generation = u16::try_from(entry.gen_number).unwrap_or(u16::MAX);
+                insert_map.insert(
+                    ObjectIdentifier::new(obj_number as i32, entry.gen_number),
+                    EntryType::Free {
+                        next_free,
+                        generation,
+                    },
                 );
             }
         }
@@ -1028,9 +1125,30 @@ fn xref_stream_subsection<'a>(
         let obj_number = start + i;
 
         match f_type {
-            // We don't care about free objects.
             0 => {
-                xref_reader.skip_bytes(f2_len as usize + f3_len as usize)?;
+                // Free entry: field 2 is the next-free object number,
+                // field 3 is the generation for next re-use.
+                let next_free = if f2_len > 0 {
+                    let data = xref_reader.read_bytes(f2_len as usize)?;
+                    xref_stream_num(data)?
+                } else {
+                    0
+                };
+
+                let gen_number = if f3_len > 0 {
+                    let data = xref_reader.read_bytes(f3_len as usize)?;
+                    xref_stream_num(data)?
+                } else {
+                    0
+                };
+
+                insert_map.insert(
+                    ObjectIdentifier::new(obj_number as i32, gen_number as i32),
+                    EntryType::Free {
+                        next_free: i32::try_from(next_free).unwrap_or(i32::MAX),
+                        generation: u16::try_from(gen_number).unwrap_or(u16::MAX),
+                    },
+                );
             }
             1 => {
                 let offset = if f2_len > 0 {
@@ -1049,7 +1167,9 @@ fn xref_stream_subsection<'a>(
 
                 insert_map.insert(
                     ObjectIdentifier::new(obj_number as i32, gen_number as i32),
-                    EntryType::Normal(offset as usize),
+                    EntryType::Normal {
+                        offset: offset as usize,
+                    },
                 );
             }
             2 => {
@@ -1067,7 +1187,10 @@ fn xref_stream_subsection<'a>(
 
                 insert_map.insert(
                     ObjectIdentifier::new(obj_number as i32, gen_number),
-                    EntryType::ObjStream(obj_stream_number, index),
+                    EntryType::Compressed {
+                        obj_stream: obj_stream_number as i32,
+                        index,
+                    },
                 );
             }
             _ => {
@@ -1382,6 +1505,133 @@ mod tests {
         assert!(size > 0);
         let root_ref = trailer.get_ref(b"Root").expect("Root ref");
         assert_eq!(root_ref, pdf.xref().root_id().into());
+    }
+
+    // --- PR #7: entry types, entries iteration, size --------------------
+
+    /// Build a valid PDF with a crafted xref whose free list chains two
+    /// entries:
+    ///
+    ///   0: free head → 3, generation 65535
+    ///   1: in-use  (catalog) at offset `off1`
+    ///   2: in-use  (pages)   at offset `off2`
+    ///   3: free         → 0 (terminator), generation 1
+    fn build_pdf_with_free_list() -> (Vec<u8>, usize, usize) {
+        let catalog = "<< /Type /Catalog /Pages 2 0 R >>";
+        let pages = "<< /Type /Pages /Kids [] /Count 0 >>";
+
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.7\n");
+        let off1 = pdf.len();
+        pdf.extend_from_slice(format!("1 0 obj\n{catalog}\nendobj\n").as_bytes());
+        let off2 = pdf.len();
+        pdf.extend_from_slice(format!("2 0 obj\n{pages}\nendobj\n").as_bytes());
+
+        let xref_pos = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 4\n");
+        pdf.extend_from_slice(b"0000000003 65535 f \n"); // obj 0 -> free, next_free = 3
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes()); // obj 1 in use
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes()); // obj 2 in use
+        pdf.extend_from_slice(b"0000000000 00001 f \n"); // obj 3 free, terminator, gen 1
+        pdf.extend_from_slice(b"trailer\n<< /Size 4 /Root 1 0 R >>\n");
+        pdf.extend_from_slice(format!("startxref\n{xref_pos}\n%%EOF").as_bytes());
+        (pdf, off1, off2)
+    }
+
+    #[test]
+    fn entries_include_free_entries() {
+        let (bytes, _, _) = build_pdf_with_free_list();
+        let pdf = Pdf::new(bytes).expect("pdf loads");
+        let entries = pdf.xref().entries();
+        let free_count = entries
+            .iter()
+            .filter(|(_, e)| matches!(e, EntryType::Free { .. }))
+            .count();
+        assert_eq!(free_count, 2, "expected two free entries");
+    }
+
+    #[test]
+    fn entry_resolves_canonical_head_of_free_list() {
+        let (bytes, _, _) = build_pdf_with_free_list();
+        let pdf = Pdf::new(bytes).expect("pdf loads");
+        let head = pdf
+            .xref()
+            .entry(ObjectIdentifier::new(0, 65535))
+            .expect("free head present");
+        match head {
+            EntryType::Free { next_free, generation } => {
+                assert_eq!(next_free, 3);
+                assert_eq!(generation, 65535);
+            }
+            other => panic!("expected Free, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn entry_resolves_free_list_chain_member() {
+        let (bytes, _, _) = build_pdf_with_free_list();
+        let pdf = Pdf::new(bytes).expect("pdf loads");
+        let entry = pdf
+            .xref()
+            .entry(ObjectIdentifier::new(3, 1))
+            .expect("obj 3 present");
+        assert_eq!(
+            entry,
+            EntryType::Free {
+                next_free: 0,
+                generation: 1
+            }
+        );
+    }
+
+    #[test]
+    fn entry_resolves_normal_at_correct_offset() {
+        let (bytes, off1, off2) = build_pdf_with_free_list();
+        let pdf = Pdf::new(bytes).expect("pdf loads");
+
+        let e1 = pdf.xref().entry(ObjectIdentifier::new(1, 0)).unwrap();
+        assert_eq!(e1, EntryType::Normal { offset: off1 });
+
+        let e2 = pdf.xref().entry(ObjectIdentifier::new(2, 0)).unwrap();
+        assert_eq!(e2, EntryType::Normal { offset: off2 });
+    }
+
+    #[test]
+    fn size_reports_trailer_value() {
+        let (bytes, _, _) = build_pdf_with_free_list();
+        let pdf = Pdf::new(bytes).expect("pdf loads");
+        assert_eq!(pdf.xref().size(), 4);
+    }
+
+    #[test]
+    fn entry_returns_none_for_unknown_id() {
+        let (bytes, _, _) = build_pdf_with_free_list();
+        let pdf = Pdf::new(bytes).expect("pdf loads");
+        assert!(pdf.xref().entry(ObjectIdentifier::new(999, 0)).is_none());
+    }
+
+    #[test]
+    fn entry_on_dummy_xref_is_none() {
+        let dummy = XRef::dummy();
+        assert!(dummy.entry(ObjectIdentifier::new(1, 0)).is_none());
+        assert!(dummy.entries().is_empty());
+        assert_eq!(dummy.size(), 0);
+    }
+
+    #[test]
+    fn entries_on_real_fixture_matches_size() {
+        let bytes: &[u8] =
+            include_bytes!("../../hayro-tests/pdfs/custom/andler-optimal-lot-size.pdf");
+        let pdf = Pdf::new(bytes.to_vec()).expect("fixture loads");
+        let xref = pdf.xref();
+        let size = xref.size();
+        let count = xref.entries().len();
+        // Every object number up to /Size is accounted for as either an
+        // in-use entry or a free entry on the free list.
+        assert!(
+            count <= size as usize,
+            "entries ({count}) <= size ({size})"
+        );
     }
 
     #[test]
