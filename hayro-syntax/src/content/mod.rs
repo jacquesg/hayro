@@ -97,6 +97,8 @@ pub struct UntypedIter<'a> {
     reader: Reader<'a>,
     stack: Stack<'a>,
     operator: Option<Operator<'a>>,
+    last_source: &'a [u8],
+    last_offset: usize,
 }
 
 impl<'a> UntypedIter<'a> {
@@ -106,6 +108,8 @@ impl<'a> UntypedIter<'a> {
             reader: Reader::new(data),
             stack: Stack::new(),
             operator: None,
+            last_source: &data[..0],
+            last_offset: 0,
         }
     }
 
@@ -115,7 +119,24 @@ impl<'a> UntypedIter<'a> {
             reader: Reader::new(&[]),
             stack: Stack::new(),
             operator: None,
+            last_source: &[],
+            last_offset: 0,
         }
+    }
+
+    /// Source bytes of the most recently yielded instruction, inside the
+    /// buffer passed to [`Self::new`] (i.e. the decoded content stream).
+    ///
+    /// Before the first successful `next()`, returns an empty slice.
+    pub fn last_source(&self) -> &'a [u8] {
+        self.last_source
+    }
+
+    /// Byte offset, inside the buffer passed to [`Self::new`], of the
+    /// most recently yielded instruction. Before the first successful
+    /// `next()`, returns `0`.
+    pub fn last_offset(&self) -> usize {
+        self.last_offset
     }
 
     /// Return the next instruction.
@@ -125,6 +146,10 @@ impl<'a> UntypedIter<'a> {
         self.operator = None;
 
         self.reader.skip_white_spaces_and_comments();
+        // Record the start offset of this instruction — i.e. the position
+        // of the first operand or of the operator, whichever appears
+        // first. Leading whitespace and comments are already skipped.
+        let start_offset = self.reader.offset();
 
         while !self.reader.at_end() {
             // I believe booleans/null never appear as an operator?
@@ -295,9 +320,18 @@ impl<'a> UntypedIter<'a> {
                 }
 
                 self.operator = Some(operator);
+                let end_offset = self.reader.offset();
+                self.last_offset = start_offset;
+                self.last_source = self
+                    .reader
+                    .data
+                    .get(start_offset..end_offset)
+                    .unwrap_or(&[]);
                 return Some(Instruction {
                     operands: &self.stack,
                     operator: self.operator.as_ref().unwrap(),
+                    source: self.last_source,
+                    offset: self.last_offset,
                 });
             }
 
@@ -325,6 +359,24 @@ impl<'a> TypedIter<'a> {
 
     pub(crate) fn from_untyped(untyped: UntypedIter<'a>) -> Self {
         Self { untyped }
+    }
+
+    /// Source bytes of the most recently yielded typed instruction,
+    /// inside the buffer passed to [`Self::new`].
+    ///
+    /// See [`Instruction::source`] for the lifetime / buffer note. Before
+    /// the first successful `next()`, returns an empty slice.
+    pub fn last_source(&self) -> &'a [u8] {
+        self.untyped.last_source()
+    }
+
+    /// Byte offset of the most recently yielded typed instruction,
+    /// inside the buffer passed to [`Self::new`].
+    ///
+    /// See [`Instruction::offset`] for the lifetime / buffer note. Before
+    /// the first successful `next()`, returns `0`.
+    pub fn last_offset(&self) -> usize {
+        self.untyped.last_offset()
     }
 
     /// Return the next typed instruction.
@@ -365,12 +417,42 @@ pub struct Instruction<'b, 'a> {
     pub operands: &'b Stack<'a>,
     /// The actual operator.
     pub operator: &'b Operator<'a>,
+    /// Raw source bytes of this instruction inside the buffer passed to
+    /// [`UntypedIter::new`]. See [`Instruction::source`].
+    source: &'a [u8],
+    /// Byte offset of this instruction inside the buffer. See
+    /// [`Instruction::offset`].
+    offset: usize,
 }
 
 impl<'b, 'a> Instruction<'b, 'a> {
     /// An iterator over the operands of the instruction.
     pub fn operands(&self) -> OperandIterator<'b, 'a> {
         OperandIterator::new(self.operands)
+    }
+
+    /// Return the raw source bytes of this instruction, including
+    /// operator and operands, inside the buffer passed to
+    /// [`UntypedIter::new`].
+    ///
+    /// This is the pre-tokenised view — string literals are undecoded,
+    /// numbers retain their source form. The buffer is the **decoded**
+    /// content stream (post-filter), not the raw PDF source bytes; see
+    /// [`Instruction::offset`] for mapping guidance.
+    pub fn source(&self) -> &'a [u8] {
+        self.source
+    }
+
+    /// Byte offset of this instruction inside the buffer passed to
+    /// [`UntypedIter::new`].
+    ///
+    /// The buffer is the decoded content stream, not the raw PDF source
+    /// bytes. To recover a PDF-file position, combine with
+    /// [`crate::object::Stream::body_range`] and knowledge of the
+    /// stream's filter chain — reversing filters is not generally
+    /// possible, and this API does not attempt it.
+    pub fn offset(&self) -> usize {
+        self.offset
     }
 }
 
@@ -666,4 +748,89 @@ mod macros {
     pub(crate) use op3;
     pub(crate) use op4;
     pub(crate) use op6;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TypedIter, UntypedIter};
+    use alloc::vec::Vec;
+
+    fn collect_untyped(data: &[u8]) -> Vec<(Vec<u8>, usize)> {
+        let mut iter = UntypedIter::new(data);
+        let mut out = Vec::new();
+        while let Some(instr) = iter.next() {
+            out.push((instr.source().to_vec(), instr.offset()));
+        }
+        out
+    }
+
+    #[test]
+    fn single_instruction_source_and_offset() {
+        let out = collect_untyped(b"100 200 m");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, b"100 200 m".to_vec());
+        assert_eq!(out[0].1, 0);
+    }
+
+    #[test]
+    fn multiple_instructions_source_spans() {
+        let content: &[u8] = b"q 100 200 m Q";
+        let out = collect_untyped(content);
+        assert_eq!(out.len(), 3);
+        for (source, offset) in &out {
+            // Source must match the bytes at the reported offset.
+            assert_eq!(&content[*offset..*offset + source.len()], source.as_slice());
+        }
+        // Operators appear in source in order.
+        assert!(out[0].0.ends_with(b"q"));
+        assert!(out[1].0.ends_with(b"m"));
+        assert!(out[2].0.ends_with(b"Q"));
+        assert!(out[0].1 < out[1].1);
+        assert!(out[1].1 < out[2].1);
+    }
+
+    #[test]
+    fn leading_whitespace_is_skipped_from_offset() {
+        let content: &[u8] = b"  q\nQ";
+        let out = collect_untyped(content);
+        assert_eq!(out.len(), 2);
+        // Offset points to the start of the first operand/operator of
+        // the instruction, not to any preceding whitespace.
+        assert_eq!(&content[out[0].1..out[0].1 + out[0].0.len()], out[0].0);
+        assert_eq!(out[0].0, b"q".to_vec());
+        assert!(out[1].1 > out[0].1);
+        assert_eq!(out[1].0, b"Q".to_vec());
+    }
+
+    #[test]
+    fn typed_iter_tracks_last_source_and_offset() {
+        let content: &[u8] = b"q 100 200 m Q";
+        let mut iter = TypedIter::new(content);
+        let mut first_offset = None;
+        while iter.next().is_some() {
+            let s = iter.last_source();
+            let o = iter.last_offset();
+            // Source at offset matches the reported slice.
+            assert_eq!(&content[o..o + s.len()], s);
+            if first_offset.is_none() {
+                first_offset = Some(o);
+            }
+        }
+        assert_eq!(first_offset, Some(0));
+    }
+
+    #[test]
+    fn operand_source_is_preserved_uninterpreted() {
+        // The untyped source should include the operand's original form,
+        // unnormalised (e.g. an explicit `+` sign).
+        let out = collect_untyped(b"+3 4 m");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, b"+3 4 m".to_vec());
+    }
+
+    #[test]
+    fn empty_stream_yields_no_instructions() {
+        assert_eq!(collect_untyped(b""), Vec::new());
+        assert_eq!(collect_untyped(b"   \n  "), Vec::new());
+    }
 }
