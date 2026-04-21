@@ -152,6 +152,135 @@ impl<'a> Stream<'a> {
         self.filters_and_params().filters
     }
 
+    /// Return the byte range of the stream body in the original PDF
+    /// source bytes.
+    ///
+    /// The range covers the **raw encoded** body — i.e. bytes as stored
+    /// on disk, including any Flate/ASCII85/etc. encoding. This is NOT
+    /// the bytes returned by [`Self::decoded`].
+    ///
+    /// Returns `None` when the body is not contiguous in the source
+    /// PDF (for example when the [`Stream`] was synthesised from
+    /// content outside the main `Arc<Data>`, as happens with inline
+    /// images constructed by the content-stream parser).
+    ///
+    /// Requires the `inspect` feature.
+    #[cfg(feature = "inspect")]
+    pub fn body_range(&self) -> Option<core::ops::Range<usize>> {
+        let ctx = self.dict.ctx();
+        let pdf_data = ctx.xref().data_bytes()?;
+
+        let pdf_start = pdf_data.as_ptr() as usize;
+        let pdf_end = pdf_start.wrapping_add(pdf_data.len());
+        let body_start_addr = self.data.as_ptr() as usize;
+        let body_end_addr = body_start_addr.wrapping_add(self.data.len());
+
+        if body_start_addr < pdf_start
+            || body_end_addr > pdf_end
+            || body_end_addr < body_start_addr
+        {
+            return None;
+        }
+
+        let body_start = body_start_addr - pdf_start;
+        let range = body_start..body_start + self.data.len();
+
+        // Sanity: verify the bytes actually match, to guard against the
+        // rare case where a separately-allocated slice happens to fall
+        // within the PDF's address range.
+        if pdf_data.get(range.clone())? != self.data {
+            return None;
+        }
+
+        Some(range)
+    }
+
+    /// Return the byte range of the stream body if and only if no
+    /// reversing filters apply.
+    ///
+    /// When the filter chain is empty or consists only of `/Identity`
+    /// (no real decoding), the decoded bytes are bytewise identical to
+    /// the encoded body, and a consumer can map a decoded-buffer offset
+    /// to a file offset via `unfiltered_body_range()?.start + decoded_offset`.
+    ///
+    /// Returns `None` when any real filter is present (`/FlateDecode`,
+    /// `/LZWDecode`, `/DCTDecode`, etc.) — reversing such filters is
+    /// not generally possible and hayro does not attempt it. Also
+    /// returns `None` whenever [`body_range`](Self::body_range) would.
+    ///
+    /// Requires the `inspect` feature.
+    #[cfg(feature = "inspect")]
+    pub fn unfiltered_body_range(&self) -> Option<core::ops::Range<usize>> {
+        if self.filters().is_empty() {
+            self.body_range()
+        } else {
+            None
+        }
+    }
+
+    /// Return the physical layout of this stream's `stream`/`endstream`
+    /// keyword pair.
+    ///
+    /// Computed on demand by scanning outward from
+    /// [`body_range`](Self::body_range). Returns `None` whenever
+    /// `body_range` would, or when the keywords cannot be located
+    /// where the parser recorded them.
+    ///
+    /// Requires the `inspect` feature.
+    #[cfg(feature = "inspect")]
+    pub fn keyword_layout(&self) -> Option<StreamKeywordLayout> {
+        let range = self.body_range()?;
+        let pdf_data = self.dict.ctx().xref().data_bytes()?;
+
+        // Identify the EOL immediately preceding the body.
+        let before_body = pdf_data.get(..range.start)?;
+        let (eol_size, stream_keyword_eol_canonical) =
+            if before_body.ends_with(b"\r\n") {
+                (2_usize, true)
+            } else if before_body.ends_with(b"\n") {
+                (1_usize, true)
+            } else if before_body.ends_with(b"\r") {
+                // CR alone is not permitted per §7.3.8.1.
+                (1_usize, false)
+            } else {
+                return None;
+            };
+
+        let stream_keyword_end = range.start.checked_sub(eol_size)?;
+        let stream_keyword_offset = stream_keyword_end.checked_sub(b"stream".len())?;
+        if pdf_data.get(stream_keyword_offset..stream_keyword_end) != Some(b"stream".as_slice()) {
+            return None;
+        }
+
+        // Locate endstream: skip any trailing whitespace after the body.
+        let mut endstream_keyword_offset = range.end;
+        while let Some(b) = pdf_data.get(endstream_keyword_offset) {
+            if b.is_ascii_whitespace() {
+                endstream_keyword_offset += 1;
+            } else {
+                break;
+            }
+        }
+        let endstream_end = endstream_keyword_offset + b"endstream".len();
+        if pdf_data.get(endstream_keyword_offset..endstream_end)
+            != Some(b"endstream".as_slice())
+        {
+            return None;
+        }
+
+        let endstream_preceded_by_eol = endstream_keyword_offset
+            .checked_sub(1)
+            .and_then(|i| pdf_data.get(i))
+            .is_some_and(|&b| b == b'\n' || b == b'\r');
+
+        Some(StreamKeywordLayout {
+            stream_keyword_offset,
+            endstream_keyword_offset,
+            stream_keyword_eol_canonical,
+            endstream_preceded_by_eol,
+        })
+    }
+
     /// Return the decoded data of the stream.
     ///
     /// Note that the result of this method will not be cached, so calling it multiple
@@ -190,6 +319,26 @@ impl<'a> Stream<'a> {
             image_data: None,
         }))
     }
+}
+
+/// Physical layout of a stream's `stream`/`endstream` keyword pair.
+///
+/// Byte offsets are positions into the **original PDF source bytes**,
+/// not into any decoded buffer. Produced by
+/// [`Stream::keyword_layout`]. Requires the `inspect` feature.
+#[cfg(feature = "inspect")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StreamKeywordLayout {
+    /// Byte offset of the `s` in `stream`.
+    pub stream_keyword_offset: usize,
+    /// Byte offset of the `e` in `endstream`.
+    pub endstream_keyword_offset: usize,
+    /// `true` when the byte(s) after `stream` are LF or CRLF. CR alone
+    /// is not permitted per ISO 32000-1 §7.3.8.1.
+    pub stream_keyword_eol_canonical: bool,
+    /// `true` when the byte immediately preceding `endstream` is LF or CR.
+    pub endstream_preceded_by_eol: bool,
 }
 
 impl Debug for Stream<'_> {
@@ -384,5 +533,164 @@ mod tests {
             .unwrap();
 
         assert_eq!(stream.data, b"abcdefghij");
+    }
+
+    // --- PR #10: body range & keyword layout ------------------------------
+
+    #[cfg(feature = "inspect")]
+    mod pr10 {
+        use crate::Pdf;
+        use crate::object::Object;
+        use alloc::format;
+        use alloc::vec::Vec;
+
+        /// Build a valid PDF with a stream at obj 3 0. `dict_extra` is
+        /// extra dict entries (e.g. `" /Filter /FlateDecode"`). `eol`
+        /// chooses the EOL after the `stream` keyword. `post_body` is
+        /// inserted between the body and `endstream`.
+        fn build_pdf_with_stream(
+            body: &[u8],
+            dict_extra: &str,
+            eol: &[u8],
+            post_body: &[u8],
+        ) -> Vec<u8> {
+            let mut pdf: Vec<u8> = Vec::new();
+            pdf.extend_from_slice(b"%PDF-1.7\n");
+            let off1 = pdf.len();
+            pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+            let off2 = pdf.len();
+            pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+            let off3 = pdf.len();
+            pdf.extend_from_slice(
+                format!("3 0 obj\n<< /Length {}{} >>\nstream", body.len(), dict_extra).as_bytes(),
+            );
+            pdf.extend_from_slice(eol);
+            pdf.extend_from_slice(body);
+            pdf.extend_from_slice(post_body);
+            pdf.extend_from_slice(b"endstream\nendobj\n");
+
+            let xref_pos = pdf.len();
+            pdf.extend_from_slice(b"xref\n0 4\n");
+            pdf.extend_from_slice(b"0000000000 65535 f \n");
+            pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+            pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+            pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+            pdf.extend_from_slice(b"trailer\n<< /Size 4 /Root 1 0 R >>\n");
+            pdf.extend_from_slice(format!("startxref\n{xref_pos}\n%%EOF").as_bytes());
+            pdf
+        }
+
+        fn first_stream(pdf: &Pdf) -> Option<Stream<'_>> {
+            for obj in pdf.objects() {
+                if let Object::Stream(s) = obj {
+                    return Some(s);
+                }
+            }
+            None
+        }
+
+        use super::Stream;
+
+        #[test]
+        fn canonical_unfiltered_stream_body_range_and_keyword_layout() {
+            let bytes = build_pdf_with_stream(b"hello", "", b"\n", b"\n");
+            let pdf = Pdf::new(bytes).expect("pdf loads");
+            let stream = first_stream(&pdf).expect("stream");
+            let range = stream.body_range().expect("body range");
+            assert_eq!(range.len(), 5);
+            assert_eq!(stream.unfiltered_body_range(), Some(range.clone()));
+            let layout = stream.keyword_layout().expect("keyword layout");
+            assert!(layout.stream_keyword_eol_canonical);
+            assert!(layout.endstream_preceded_by_eol);
+            assert!(layout.stream_keyword_offset < range.start);
+            assert!(layout.endstream_keyword_offset >= range.end);
+        }
+
+        #[test]
+        fn cr_alone_after_stream_is_not_canonical() {
+            let bytes = build_pdf_with_stream(b"hello", "", b"\r", b"\n");
+            let pdf = Pdf::new(bytes).expect("pdf loads");
+            let stream = first_stream(&pdf).expect("stream");
+            let layout = stream.keyword_layout().expect("keyword layout");
+            assert!(!layout.stream_keyword_eol_canonical);
+        }
+
+        #[test]
+        fn crlf_after_stream_is_canonical() {
+            let bytes = build_pdf_with_stream(b"hello", "", b"\r\n", b"\n");
+            let pdf = Pdf::new(bytes).expect("pdf loads");
+            let stream = first_stream(&pdf).expect("stream");
+            let layout = stream.keyword_layout().expect("keyword layout");
+            assert!(layout.stream_keyword_eol_canonical);
+        }
+
+        #[test]
+        fn endstream_without_preceding_eol_flag_false() {
+            // No EOL between body and endstream.
+            let bytes = build_pdf_with_stream(b"hello", "", b"\n", b"");
+            let pdf = Pdf::new(bytes).expect("pdf loads");
+            let stream = first_stream(&pdf).expect("stream");
+            let layout = stream.keyword_layout().expect("keyword layout");
+            assert!(!layout.endstream_preceded_by_eol);
+        }
+
+        #[test]
+        fn flate_filter_disables_unfiltered_body_range() {
+            // Minimal valid zlib payload: two bytes of zero content ("\x78\x9c\x03\x00\x00\x00\x00\x01").
+            let flate_body: &[u8] = b"\x78\x9c\x03\x00\x00\x00\x00\x01";
+            let bytes = build_pdf_with_stream(flate_body, " /Filter /FlateDecode", b"\n", b"\n");
+            let pdf = Pdf::new(bytes).expect("pdf loads");
+            let stream = first_stream(&pdf).expect("stream");
+            assert!(stream.body_range().is_some());
+            assert_eq!(stream.unfiltered_body_range(), None);
+        }
+
+        #[test]
+        fn identity_filter_is_treated_as_no_filter() {
+            // `/Identity` is not a recognised reversing filter; filters() stays empty.
+            let bytes = build_pdf_with_stream(b"hello", " /Filter /Identity", b"\n", b"\n");
+            let pdf = Pdf::new(bytes).expect("pdf loads");
+            let stream = first_stream(&pdf).expect("stream");
+            let body = stream.body_range().expect("body range");
+            assert_eq!(stream.unfiltered_body_range(), Some(body));
+        }
+
+        #[test]
+        fn body_range_bytes_match_source() {
+            let bytes = build_pdf_with_stream(b"hello world", "", b"\n", b"\n");
+            let pdf = Pdf::new(bytes.clone()).expect("pdf loads");
+            let stream = first_stream(&pdf).expect("stream");
+            let range = stream.body_range().expect("body range");
+            assert_eq!(&bytes[range], b"hello world");
+        }
+
+        #[test]
+        fn flate_body_range_matches_source_length() {
+            let flate_body: &[u8] = b"\x78\x9c\x03\x00\x00\x00\x00\x01";
+            let bytes = build_pdf_with_stream(flate_body, " /Filter /FlateDecode", b"\n", b"\n");
+            let pdf = Pdf::new(bytes.clone()).expect("pdf loads");
+            let stream = first_stream(&pdf).expect("stream");
+            let range = stream.body_range().expect("body range");
+            assert_eq!(range.len(), flate_body.len());
+            assert_eq!(&bytes[range], flate_body);
+        }
+
+        #[test]
+        fn tier_b_flate_fixture_body_range() {
+            // andler-optimal-lot-size has Flate-compressed streams.
+            let bytes: &[u8] = include_bytes!(
+                "../../../hayro-tests/pdfs/custom/andler-optimal-lot-size.pdf"
+            );
+            let pdf = Pdf::new(bytes.to_vec()).expect("fixture loads");
+            let stream = first_stream(&pdf).expect("fixture has at least one stream");
+            let range = stream.body_range().expect("body range");
+            assert!(!range.is_empty());
+            // Declared /Length must match the byte-range length for a
+            // well-formed stream.
+            let declared: Option<u32> = stream.dict().get(b"Length");
+            if let Some(n) = declared {
+                assert_eq!(range.len(), n as usize);
+            }
+        }
     }
 }
