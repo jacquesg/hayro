@@ -286,6 +286,11 @@ impl XRef {
         // and then populate the data.
         let trailer_data = TrailerData::dummy();
 
+        let trailer_dict_bytes = match input {
+            XRefInput::TrailerDictData(bytes) => Some(Arc::from(bytes)),
+            XRefInput::RootRef(_) => None,
+        };
+
         let mut xref = Self(Inner::Some(Arc::new(SomeRepr {
             data: Arc::new(Data::new(data)),
             map: Arc::new(RwLock::new(MapRepr { xref_map, repaired })),
@@ -293,6 +298,7 @@ impl XRef {
             has_ocgs: false,
             metadata: Arc::new(Metadata::default()),
             trailer_data,
+            trailer_dict_bytes,
             password: password.to_vec(),
         })));
 
@@ -419,6 +425,42 @@ impl XRef {
     /// Return the object ID of the root dictionary.
     pub fn root_id(&self) -> ObjectIdentifier {
         self.trailer_data().root_ref
+    }
+
+    /// Return the document's trailer dictionary.
+    ///
+    /// For a conventional xref table this is the dict following the last
+    /// `trailer` keyword; for an xref stream it is the stream's own dict.
+    /// Returns `None` for a dummy xref, or when the original trailer could
+    /// not be recovered and the xref was reconstructed from a fallback
+    /// root reference.
+    ///
+    /// For a document with incremental updates, this is the trailer
+    /// reached via the final `startxref`, as specified by
+    /// ISO 32000-1 §7.5.6.
+    ///
+    /// # Performance
+    ///
+    /// This re-parses the trailer dict from a cached byte slice on every
+    /// call. The parse is cheap (proportional to the dict size, no xref
+    /// traversal) but not free; consumers making many reads from the same
+    /// trailer should bind the result once rather than re-calling the
+    /// method in a loop:
+    ///
+    /// ```ignore
+    /// let trailer = xref.trailer()?;
+    /// let id = trailer.get::<Array>(b"ID");
+    /// let size: Option<i32> = trailer.get(b"Size");
+    /// ```
+    pub fn trailer(&self) -> Option<Dict<'_>> {
+        match &self.0 {
+            Inner::Dummy => None,
+            Inner::Some(r) => {
+                let bytes = r.trailer_dict_bytes.as_deref()?;
+                let mut reader = Reader::new(bytes);
+                reader.read_with_context::<Dict<'_>>(&ReaderContext::new(self, false))
+            }
+        }
     }
 
     /// Whether the PDF has optional content groups.
@@ -683,6 +725,11 @@ struct SomeRepr {
     has_ocgs: bool,
     password: Vec<u8>,
     trailer_data: TrailerData,
+    /// Raw bytes of the trailer dictionary, retained so that
+    /// [`XRef::trailer`] can re-parse the full trailer on demand. `None`
+    /// when the xref was built from a [`XRefInput::RootRef`] fallback,
+    /// i.e. the original trailer could not be read.
+    trailer_dict_bytes: Option<Arc<[u8]>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1119,6 +1166,129 @@ fn parse_metadata(info_dict: &Dict<'_>) -> Metadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Pdf;
+    use crate::object::Array;
+
+    /// Build a minimal valid PDF with the given object bodies and trailer
+    /// entries, computing the xref offsets automatically. Object numbers
+    /// start at 1 and are consecutive.
+    fn build_pdf(objects: &[&str], trailer_entries: &str) -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n");
+
+        let mut offsets: Vec<usize> = Vec::with_capacity(objects.len());
+        for (i, body) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+            pdf.extend_from_slice(body.as_bytes());
+            pdf.extend_from_slice(b"\nendobj\n");
+        }
+
+        let xref_pos = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for off in &offsets {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(b"trailer\n");
+        pdf.extend_from_slice(
+            format!(
+                "<< /Size {size} {entries} >>\n",
+                size = objects.len() + 1,
+                entries = trailer_entries,
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(format!("startxref\n{xref_pos}\n%%EOF").as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn trailer_returns_some_and_carries_id_array() {
+        // Catalog + Pages + document-info, with /ID in the trailer.
+        let bytes = build_pdf(
+            &[
+                "<< /Type /Catalog /Pages 2 0 R >>",
+                "<< /Type /Pages /Kids [] /Count 0 >>",
+                "<< /Title (Test) >>",
+            ],
+            "/Root 1 0 R /Info 3 0 R /ID [<abcdef> <012345>]",
+        );
+        let pdf = Pdf::new(bytes).expect("pdf loads");
+        let trailer = pdf.trailer().expect("trailer available");
+        let id = trailer.get::<Array<'_>>(b"ID").expect("ID array");
+        assert_eq!(id.iter::<object::String<'_>>().count(), 2);
+    }
+
+    #[test]
+    fn trailer_resolves_info_indirect_ref() {
+        let bytes = build_pdf(
+            &[
+                "<< /Type /Catalog /Pages 2 0 R >>",
+                "<< /Type /Pages /Kids [] /Count 0 >>",
+                "<< /Title (Doc) >>",
+            ],
+            "/Root 1 0 R /Info 3 0 R",
+        );
+        let pdf = Pdf::new(bytes).expect("pdf loads");
+        let trailer = pdf.trailer().expect("trailer available");
+        let info_ref = trailer.get_ref(b"Info").expect("Info ref");
+        assert_eq!(info_ref.obj_number, 3);
+        assert_eq!(info_ref.gen_number, 0);
+    }
+
+    #[test]
+    fn trailer_exposes_size() {
+        let bytes = build_pdf(
+            &[
+                "<< /Type /Catalog /Pages 2 0 R >>",
+                "<< /Type /Pages /Kids [] /Count 0 >>",
+            ],
+            "/Root 1 0 R",
+        );
+        let pdf = Pdf::new(bytes).expect("pdf loads");
+        let trailer = pdf.trailer().expect("trailer available");
+        // Four entries: the null free-list entry plus three objects.
+        let size: i32 = trailer.get(b"Size").expect("Size integer");
+        assert_eq!(size, 3);
+    }
+
+    #[test]
+    fn trailer_on_dummy_xref_returns_none() {
+        let dummy = XRef::dummy();
+        assert!(dummy.trailer().is_none());
+    }
+
+    #[test]
+    fn trailer_parses_same_dict_on_repeated_calls() {
+        let bytes = build_pdf(
+            &[
+                "<< /Type /Catalog /Pages 2 0 R >>",
+                "<< /Type /Pages /Kids [] /Count 0 >>",
+            ],
+            "/Root 1 0 R /ID [<aa> <bb>]",
+        );
+        let pdf = Pdf::new(bytes).expect("pdf loads");
+        let first = pdf.trailer().expect("trailer available");
+        let second = pdf.trailer().expect("trailer available");
+        // Re-parse must be deterministic: same keys on both calls.
+        let k1: Vec<Vec<u8>> = first.keys().map(|k| k.as_ref().to_vec()).collect();
+        let k2: Vec<Vec<u8>> = second.keys().map(|k| k.as_ref().to_vec()).collect();
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn trailer_on_real_fixture_has_size_and_root() {
+        // Tier B: committed fixture.
+        let bytes: &[u8] =
+            include_bytes!("../../hayro-tests/pdfs/custom/andler-optimal-lot-size.pdf");
+        let pdf = Pdf::new(bytes.to_vec()).expect("fixture loads");
+        let trailer = pdf.trailer().expect("trailer available");
+        let size: i32 = trailer.get(b"Size").expect("Size integer");
+        assert!(size > 0);
+        let root_ref = trailer.get_ref(b"Root").expect("Root ref");
+        assert_eq!(root_ref, pdf.xref().root_id().into());
+    }
 
     #[test]
     fn circular_prev_chain() {
