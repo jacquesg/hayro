@@ -24,6 +24,7 @@ unsafe = [
     "zune-jpeg?/neon",
 ]
 logging = ["dep:log", "beeld-jpeg2000?/logging"]
+inspect = []
 
 [dependencies]
 log = { workspace = true, optional = true }
