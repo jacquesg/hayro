@@ -10,7 +10,7 @@ pub use crate::object::number::{Number, NumberKind};
 pub use crate::object::rect::Rect;
 pub use crate::object::r#ref::{MaybeRef, ObjRef};
 pub use crate::object::stream::Stream;
-pub use crate::object::string::String;
+pub use crate::object::string::{String, StringKind};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 use core::fmt::Debug;
@@ -383,13 +383,13 @@ mod tests {
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn object_sizes() {
-        assert_eq!(size_of::<Object<'_>>(), 40);
+        assert_eq!(size_of::<Object<'_>>(), 56);
         assert_eq!(size_of::<Array<'_>>(), 32);
         assert_eq!(size_of::<Dict<'_>>(), 8);
         assert_eq!(size_of::<Name<'_>>(), 32);
         assert_eq!(size_of::<Null>(), 0);
         assert_eq!(size_of::<Number>(), 16);
         assert_eq!(size_of::<Stream<'_>>(), 24);
-        assert_eq!(size_of::<String<'_>>(), 32);
+        assert_eq!(size_of::<String<'_>>(), 56);
     }
 }
