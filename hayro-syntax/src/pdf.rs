@@ -17,6 +17,8 @@ pub struct Pdf {
     header_version: PdfVersion,
     pages: CachedPages,
     data: PdfData,
+    #[cfg(feature = "inspect")]
+    layout: crate::sync::OnceLock<crate::layout::FileLayout>,
 }
 
 /// An error that occurred while loading a PDF file.
@@ -65,6 +67,8 @@ impl Pdf {
             header_version: version,
             pages,
             data,
+            #[cfg(feature = "inspect")]
+            layout: crate::sync::OnceLock::new(),
         })
     }
 
@@ -128,6 +132,18 @@ impl Pdf {
     pub fn is_encrypted(&self) -> bool {
         self.xref.is_encrypted()
     }
+
+    /// Compute the file-level physical layout.
+    ///
+    /// Scans the raw bytes on first call; the result is cached and
+    /// returned by reference on subsequent calls. Idempotent.
+    ///
+    /// Requires the `inspect` feature.
+    #[cfg(feature = "inspect")]
+    pub fn file_layout(&self) -> &crate::layout::FileLayout {
+        self.layout
+            .get_or_init(|| crate::layout::FileLayout::compute(self.data.as_ref()))
+    }
 }
 
 fn find_version(data: &[u8]) -> Option<PdfVersion> {
@@ -188,6 +204,31 @@ mod tests {
     #[test]
     fn issue_49() {
         let _ = Pdf::new(Vec::new());
+    }
+
+    #[cfg(feature = "inspect")]
+    #[test]
+    fn file_layout_matches_real_fixture() {
+        let bytes: &[u8] =
+            include_bytes!("../../hayro-tests/pdfs/custom/andler-optimal-lot-size.pdf");
+        let pdf = Pdf::new(bytes.to_vec()).expect("fixture loads");
+        let layout = pdf.file_layout();
+        assert!(!layout.eof_offsets.is_empty());
+        assert_eq!(layout.file_size, bytes.len());
+        // Header must be within the file.
+        assert!(layout.header_offset < layout.file_size);
+    }
+
+    #[cfg(feature = "inspect")]
+    #[test]
+    fn file_layout_is_cached() {
+        let bytes: &[u8] =
+            include_bytes!("../../hayro-tests/pdfs/custom/andler-optimal-lot-size.pdf");
+        let pdf = Pdf::new(bytes.to_vec()).expect("fixture loads");
+        let first = pdf.file_layout() as *const _;
+        let second = pdf.file_layout() as *const _;
+        // Cache returns the same reference, not a fresh computation.
+        assert_eq!(first, second);
     }
 
     #[test]
