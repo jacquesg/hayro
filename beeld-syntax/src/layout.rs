@@ -3,12 +3,15 @@
 //! This module surfaces byte-level information about the PDF file's outer
 //! structure — the position of the `%PDF-` header, the four binary-marker
 //! bytes following it, every `%%EOF` offset, and the count of bytes
-//! trailing the last `%%EOF`. Conformance and repair tooling needs this
+//! trailing the last `%%EOF` — plus per-object layout (byte range,
+//! keyword canonicity). Conformance and repair tooling needs this
 //! information; pure rendering does not.
 //!
 //! Gated on the `inspect` feature, per §1.4 of the fork roadmap.
 
+use crate::object::ObjectIdentifier;
 use alloc::vec::Vec;
+use core::ops::Range;
 
 /// File-level physical layout of a PDF document.
 ///
@@ -131,6 +134,168 @@ fn scan_binary_marker(data: &[u8], header_offset: usize) -> Option<[u8; 4]> {
     }
 }
 
+/// Physical layout of an indirect object that lives directly in the PDF.
+///
+/// Captures the `N G obj … endobj` span and three canonical-form flags
+/// used by conformance tooling that validates §7.3.10 object layout.
+/// Produced by [`crate::xref::XRef::indirect_layout`]. Requires the
+/// `inspect` feature.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct IndirectLayout {
+    /// Byte range of the whole `N G obj … endobj` header-through-keyword.
+    pub range: Range<usize>,
+    /// `true` when the header is `N<SP>G<SP>obj<EOL>` with exactly one
+    /// ASCII SP (`0x20`) between `N` and `G`, one between `G` and
+    /// `obj`, and `obj` followed by a single EOL (LF / CR / CRLF).
+    pub header_canonical: bool,
+    /// `true` when `endobj` is preceded by an EOL marker
+    /// (LF / CR / CRLF).
+    pub endobj_preceded_by_eol: bool,
+    /// `true` when `endobj` is followed by an EOL marker or EOF.
+    pub endobj_followed_by_eol: bool,
+}
+
+/// Result of resolving an object identifier against the xref for layout
+/// information.
+///
+/// Every case of an xref entry has its own variant so callers do not
+/// need to pattern-match on `Option<..>` and re-resolve the
+/// compressed-object hop themselves. Requires the `inspect` feature.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LayoutKind {
+    /// Object is stored directly in the PDF; `layout` describes its
+    /// `N G obj … endobj` span.
+    Direct(IndirectLayout),
+    /// Object is stored compressed inside an object stream.
+    Compressed {
+        /// Object identifier of the hosting object stream.
+        host: ObjectIdentifier,
+        /// Layout of the hosting object stream itself. Object streams
+        /// always live directly in the PDF.
+        host_layout: IndirectLayout,
+        /// Zero-based position of the object inside the stream.
+        index: u32,
+    },
+    /// Object is a free entry on the free list.
+    Free,
+}
+
+/// Scan the indirect-object span starting at `offset` in `data`.
+///
+/// Returns `None` if the header does not parse as `N<whitespace>G<whitespace>obj`
+/// or if `endobj` is not found. Header-canonicity and EOL flags are
+/// populated per [`IndirectLayout`].
+pub(crate) fn scan_indirect_layout(data: &[u8], offset: usize) -> Option<IndirectLayout> {
+    let tail = data.get(offset..)?;
+
+    let (header_canonical, header_end) = parse_indirect_header(tail)?;
+
+    // Find `endobj` in the body after the header.
+    let endobj_rel = find_subslice(&tail[header_end..], b"endobj")? + header_end;
+    let endobj_pos = offset + endobj_rel;
+    let endobj_end = endobj_pos + b"endobj".len();
+
+    // The byte immediately before `endobj` — relative to the full data
+    // slice, not to `tail` — determines the preceding-EOL flag.
+    let endobj_preceded_by_eol = endobj_pos > 0
+        && matches!(data.get(endobj_pos - 1), Some(b'\n') | Some(b'\r'));
+    let endobj_followed_by_eol = match data.get(endobj_end) {
+        None => true,
+        Some(b'\n') | Some(b'\r') => true,
+        Some(_) => false,
+    };
+
+    Some(IndirectLayout {
+        range: offset..endobj_end,
+        header_canonical,
+        endobj_preceded_by_eol,
+        endobj_followed_by_eol,
+    })
+}
+
+/// Parse an `N G obj` header.
+///
+/// Returns `(canonical, bytes_consumed)` on success. `canonical` is
+/// `true` iff exactly one ASCII SP separates each token and `obj` is
+/// followed by a single EOL marker.
+fn parse_indirect_header(data: &[u8]) -> Option<(bool, usize)> {
+    let mut i = 0;
+
+    // N (digits)
+    let n_start = i;
+    while matches!(data.get(i), Some(b'0'..=b'9')) {
+        i += 1;
+    }
+    if i == n_start {
+        return None;
+    }
+
+    // One SP between N and G (canonical); otherwise accept any whitespace run.
+    let sp1_canonical = data.get(i) == Some(&b' ');
+    let (skipped_1, i2) = skip_ws_counting(data, i);
+    if skipped_1 == 0 {
+        return None;
+    }
+    i = i2;
+
+    // G (digits)
+    let g_start = i;
+    while matches!(data.get(i), Some(b'0'..=b'9')) {
+        i += 1;
+    }
+    if i == g_start {
+        return None;
+    }
+
+    // One SP between G and obj (canonical).
+    let sp2_canonical = data.get(i) == Some(&b' ');
+    let (skipped_2, i3) = skip_ws_counting(data, i);
+    if skipped_2 == 0 {
+        return None;
+    }
+    i = i3;
+
+    // `obj` keyword.
+    if data.get(i..i + 3)? != b"obj" {
+        return None;
+    }
+    i += 3;
+
+    // Single EOL (CR / LF / CRLF).
+    let eol_ok = match data.get(i) {
+        Some(b'\r') => {
+            i += 1;
+            if data.get(i) == Some(&b'\n') {
+                i += 1;
+            }
+            true
+        }
+        Some(b'\n') => {
+            i += 1;
+            true
+        }
+        _ => false,
+    };
+
+    let canonical = sp1_canonical && skipped_1 == 1 && sp2_canonical && skipped_2 == 1 && eol_ok;
+    Some((canonical, i))
+}
+
+fn skip_ws_counting(data: &[u8], start: usize) -> (usize, usize) {
+    let mut count = 0;
+    let mut i = start;
+    while matches!(
+        data.get(i),
+        Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
+    ) {
+        count += 1;
+        i += 1;
+    }
+    (count, i)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,5 +398,73 @@ mod tests {
         let data = b"%PDF-1.7\n%\xe2\xe3\xcf";
         let layout = FileLayout::compute(data);
         assert!(layout.binary_marker.is_none());
+    }
+
+    // --- indirect-object layout scanner -------------------------------
+
+    #[test]
+    fn canonical_indirect_layout() {
+        let data = b"5 0 obj\n(hi)\nendobj\n";
+        let layout = scan_indirect_layout(data, 0).expect("layout");
+        assert!(layout.header_canonical);
+        assert!(layout.endobj_preceded_by_eol);
+        assert!(layout.endobj_followed_by_eol);
+        assert_eq!(layout.range.start, 0);
+        assert_eq!(layout.range.end, data.len() - 1); // minus final \n
+    }
+
+    #[test]
+    fn tab_between_n_and_g_is_not_canonical() {
+        let data = b"5\t0 obj\n(hi)\nendobj\n";
+        let layout = scan_indirect_layout(data, 0).expect("layout");
+        assert!(!layout.header_canonical);
+    }
+
+    #[test]
+    fn two_spaces_between_tokens_is_not_canonical() {
+        let data = b"5  0 obj\n(hi)\nendobj\n";
+        let layout = scan_indirect_layout(data, 0).expect("layout");
+        assert!(!layout.header_canonical);
+    }
+
+    #[test]
+    fn endobj_without_trailing_eol_flag_false() {
+        // `endobj` immediately followed by the next `N G obj`.
+        let data = b"5 0 obj\n(hi)\nendobj6 0 obj\n(x)\nendobj\n";
+        let layout = scan_indirect_layout(data, 0).expect("layout");
+        assert!(!layout.endobj_followed_by_eol);
+    }
+
+    #[test]
+    fn endobj_without_preceding_eol_flag_false() {
+        // `endobj` directly after content with no EOL.
+        let data = b"5 0 obj\n(hi)endobj\n";
+        let layout = scan_indirect_layout(data, 0).expect("layout");
+        assert!(!layout.endobj_preceded_by_eol);
+        assert!(layout.endobj_followed_by_eol);
+    }
+
+    #[test]
+    fn header_missing_obj_keyword_rejected() {
+        let data = b"5 0 xyz\n(hi)\nendobj\n";
+        assert!(scan_indirect_layout(data, 0).is_none());
+    }
+
+    #[test]
+    fn header_without_eol_after_obj_not_canonical() {
+        let data = b"5 0 obj(hi)endobj\n";
+        let layout = scan_indirect_layout(data, 0).expect("layout");
+        assert!(!layout.header_canonical);
+    }
+
+    #[test]
+    fn offset_into_middle_of_buffer_works() {
+        let data = b"garbage5 0 obj\n(hi)\nendobj\nmore";
+        let layout = scan_indirect_layout(data, 7).expect("layout");
+        assert!(layout.header_canonical);
+        assert_eq!(layout.range.start, 7);
+        // endobj ends just before `\nmore` → offset of `\n` is 7 + 7 + "(hi)\n".len() + "endobj".len()
+        // Actual: 7 + 13 (header) + 5 ("(hi)\n") + 6 ("endobj") — tricky, just assert bounds.
+        assert!(data[layout.range.clone()].ends_with(b"endobj"));
     }
 }

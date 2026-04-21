@@ -446,6 +446,57 @@ impl XRef {
         }
     }
 
+    /// Resolve layout information for an indirect object.
+    ///
+    /// Returns `None` when `id` is absent from the xref table. For every
+    /// present entry — `Normal`, `Compressed`, or `Free` — a
+    /// [`LayoutKind`](crate::layout::LayoutKind) variant names the case
+    /// explicitly; callers do not have to hop through the hosting
+    /// object stream themselves.
+    ///
+    /// Malformed cases (e.g. a compressed entry whose host is itself
+    /// compressed or free — illegal per ISO 32000-1 §7.5.7) also return
+    /// `None`; hayro does not attempt recovery.
+    ///
+    /// Requires the `inspect` feature.
+    #[cfg(feature = "inspect")]
+    pub fn indirect_layout(
+        &self,
+        id: ObjectIdentifier,
+    ) -> Option<crate::layout::LayoutKind> {
+        use crate::layout::{LayoutKind, scan_indirect_layout};
+
+        let repr = match &self.0 {
+            Inner::Dummy => return None,
+            Inner::Some(r) => r,
+        };
+        let entry = repr.map.get().xref_map.get(&id).copied()?;
+        let data = repr.data.get().as_ref();
+
+        match entry {
+            EntryType::Free { .. } => Some(LayoutKind::Free),
+            EntryType::Normal { offset } => {
+                let layout = scan_indirect_layout(data, offset)?;
+                Some(LayoutKind::Direct(layout))
+            }
+            EntryType::Compressed { obj_stream, index } => {
+                let host = ObjectIdentifier::new(obj_stream, 0);
+                let host_entry = repr.map.get().xref_map.get(&host).copied()?;
+                let host_offset = match host_entry {
+                    EntryType::Normal { offset } => offset,
+                    // Host of a compressed entry must itself be direct.
+                    _ => return None,
+                };
+                let host_layout = scan_indirect_layout(data, host_offset)?;
+                Some(LayoutKind::Compressed {
+                    host,
+                    host_layout,
+                    index,
+                })
+            }
+        }
+    }
+
     /// Return the logical size of the cross-reference table.
     ///
     /// This is the trailer's `/Size` value when present, falling back to
@@ -1616,6 +1667,95 @@ mod tests {
         assert!(dummy.entry(ObjectIdentifier::new(1, 0)).is_none());
         assert!(dummy.entries().is_empty());
         assert_eq!(dummy.size(), 0);
+    }
+
+    // --- PR #9: indirect layout -----------------------------------------
+
+    #[cfg(feature = "inspect")]
+    #[test]
+    fn indirect_layout_direct_canonical() {
+        use crate::layout::LayoutKind;
+
+        let (bytes, off1, _) = build_pdf_with_free_list();
+        let pdf = Pdf::new(bytes).expect("pdf loads");
+        let kind = pdf
+            .xref()
+            .indirect_layout(ObjectIdentifier::new(1, 0))
+            .expect("layout for obj 1");
+        match kind {
+            LayoutKind::Direct(layout) => {
+                assert_eq!(layout.range.start, off1);
+                assert!(layout.header_canonical);
+                assert!(layout.endobj_preceded_by_eol);
+                assert!(layout.endobj_followed_by_eol);
+            }
+            other => panic!("expected Direct, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "inspect")]
+    #[test]
+    fn indirect_layout_free_entry() {
+        use crate::layout::LayoutKind;
+
+        let (bytes, _, _) = build_pdf_with_free_list();
+        let pdf = Pdf::new(bytes).expect("pdf loads");
+        let kind = pdf
+            .xref()
+            .indirect_layout(ObjectIdentifier::new(3, 1))
+            .expect("layout for free obj");
+        assert_eq!(kind, LayoutKind::Free);
+    }
+
+    #[cfg(feature = "inspect")]
+    #[test]
+    fn indirect_layout_absent_id_is_none() {
+        let (bytes, _, _) = build_pdf_with_free_list();
+        let pdf = Pdf::new(bytes).expect("pdf loads");
+        assert!(
+            pdf.xref()
+                .indirect_layout(ObjectIdentifier::new(99, 0))
+                .is_none()
+        );
+    }
+
+    #[cfg(feature = "inspect")]
+    #[test]
+    fn indirect_layout_on_dummy_xref_is_none() {
+        let dummy = XRef::dummy();
+        assert!(
+            dummy
+                .indirect_layout(ObjectIdentifier::new(1, 0))
+                .is_none()
+        );
+    }
+
+    #[cfg(feature = "inspect")]
+    #[test]
+    fn indirect_layout_compressed_via_real_fixture() {
+        use crate::layout::LayoutKind;
+
+        let bytes: &[u8] =
+            include_bytes!("../../hayro-tests/pdfs/custom/catalog-in-objstm-aes.pdf");
+        let pdf = Pdf::new(bytes.to_vec()).expect("fixture loads");
+        let catalog_id = pdf.xref().root_id();
+        let kind = pdf
+            .xref()
+            .indirect_layout(catalog_id)
+            .expect("layout for catalog");
+        match kind {
+            LayoutKind::Compressed {
+                host,
+                host_layout,
+                index: _,
+            } => {
+                // The host stream itself must be direct (never compressed).
+                let host_kind = pdf.xref().indirect_layout(host).expect("host layout");
+                assert!(matches!(host_kind, LayoutKind::Direct(_)));
+                assert!(host_layout.range.start < host_layout.range.end);
+            }
+            other => panic!("expected Compressed catalog, got {other:?}"),
+        }
     }
 
     #[test]
