@@ -4,6 +4,7 @@ pub use crate::object::array::Array;
 pub use crate::object::date::DateTime;
 pub use crate::object::dict::Dict;
 pub use crate::object::name::Name;
+pub use crate::object::name_tree::NameTree;
 use crate::object::name::skip_name_like;
 pub use crate::object::null::Null;
 pub use crate::object::number::{Number, NumberKind};
@@ -26,6 +27,7 @@ mod tuple;
 
 pub(crate) mod indirect;
 pub(crate) mod name;
+pub mod name_tree;
 
 pub mod array;
 pub mod dict;
