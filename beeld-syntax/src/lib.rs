@@ -93,6 +93,8 @@ pub(crate) mod util;
 
 pub mod content;
 mod crypto;
+#[cfg(feature = "inspect")]
+pub mod layout;
 pub mod metadata;
 pub mod object;
 pub mod page;
