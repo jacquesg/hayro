@@ -446,6 +446,38 @@ impl XRef {
         }
     }
 
+    /// Return all cross-reference sections, ordered most-recent-first.
+    ///
+    /// The sections are discovered by walking the file's `startxref`
+    /// and following each section's `/Prev` entry. Ordering follows the
+    /// walk, so the section reached via the final `startxref` appears
+    /// first and each predecessor follows.
+    ///
+    /// # Performance
+    ///
+    /// Walks the chain from the retained PDF data on each call; no
+    /// section-tracking state is retained at parse time. One call is
+    /// O(chain length) and allocates one `Vec`. Consumers should bind
+    /// the result once.
+    ///
+    /// Requires the `inspect` feature.
+    #[cfg(feature = "inspect")]
+    pub fn sections(&self) -> Vec<XRefSection> {
+        match &self.0 {
+            Inner::Dummy => Vec::new(),
+            Inner::Some(r) => {
+                let data = r.data.get().as_ref();
+                let Some(start_pos) = find_last_xref_pos(data) else {
+                    return Vec::new();
+                };
+                let mut out: Vec<XRefSection> = Vec::new();
+                let mut visited: BTreeSet<usize> = BTreeSet::new();
+                collect_sections(data, start_pos, &mut out, &mut visited);
+                out
+            }
+        }
+    }
+
     /// Resolve layout information for an indirect object.
     ///
     /// Returns `None` when `id` is absent from the xref table. For every
@@ -1365,6 +1397,170 @@ fn parse_metadata(info_dict: &Dict<'_>) -> Metadata {
     }
 }
 
+/// The serialisation form of a cross-reference section.
+///
+/// ISO 32000-1 §7.5.4 describes the classical `xref` keyword table;
+/// §7.5.8 introduced xref streams in PDF 1.5.
+///
+/// Requires the `inspect` feature.
+#[cfg(feature = "inspect")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum XRefKind {
+    /// Classical `xref` keyword + subsection headers (§7.5.4).
+    Table,
+    /// Xref stream object (§7.5.8).
+    Stream,
+}
+
+/// A single cross-reference section in the file.
+///
+/// A document may have multiple sections if incremental updates were
+/// used (§7.5.6). Returned by [`XRef::sections`] in
+/// `startxref → /Prev` walk order (most-recent-first).
+///
+/// Requires the `inspect` feature.
+#[cfg(feature = "inspect")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct XRefSection {
+    /// Byte offset of the section, at the `xref` keyword or the xref
+    /// stream object's `N G obj` header.
+    pub offset: usize,
+    /// Serialisation form of this section.
+    pub kind: XRefKind,
+    /// For [`XRefKind::Table`]: byte ranges of each subsection header
+    /// line (e.g. `0 4`) in file order. Empty for xref streams.
+    pub subsection_headers: Vec<core::ops::Range<usize>>,
+    /// Byte offset of the `xref` keyword (for `Table`) or the stream
+    /// object's `N G obj` header (for `Stream`). Equal to `offset`.
+    pub keyword_offset: usize,
+    /// Byte following the terminator of the section: the position
+    /// after the trailer dict for `Table`, or after `endobj` for
+    /// `Stream`.
+    pub end_offset: usize,
+}
+
+/// Walk the `startxref` + `/Prev` chain starting at `pos`, collecting
+/// section metadata. Silent on malformed sections (just stops).
+#[cfg(feature = "inspect")]
+fn collect_sections(
+    data: &[u8],
+    pos: usize,
+    out: &mut Vec<XRefSection>,
+    visited: &mut BTreeSet<usize>,
+) {
+    if !visited.insert(pos) {
+        return;
+    }
+    let Some(tail) = data.get(pos..) else {
+        return;
+    };
+
+    if tail.starts_with(b"xref") {
+        if let Some((section, prev)) = scan_table_section(data, pos) {
+            out.push(section);
+            if let Some(prev_pos) = prev {
+                collect_sections(data, prev_pos, out, visited);
+            }
+        }
+    } else {
+        // Xref stream — the position should be at a `N G obj` header.
+        if let Some((section, prev)) = scan_stream_section(data, pos) {
+            out.push(section);
+            if let Some(prev_pos) = prev {
+                collect_sections(data, prev_pos, out, visited);
+            }
+        }
+    }
+}
+
+/// Scan a classical xref table section. Returns the section metadata
+/// and the `/Prev` offset if present.
+#[cfg(feature = "inspect")]
+fn scan_table_section(data: &[u8], pos: usize) -> Option<(XRefSection, Option<usize>)> {
+    let mut reader = Reader::new(data);
+    reader.jump(pos);
+    reader.forward_tag(b"xref")?;
+    reader.skip_white_spaces();
+
+    let mut subsection_headers: Vec<core::ops::Range<usize>> = Vec::new();
+
+    loop {
+        reader.skip_white_spaces();
+        let header_start = reader.offset();
+        let header = match reader.read_without_context::<SubsectionHeader>() {
+            Some(h) => h,
+            None => break,
+        };
+        let header_end = reader.offset();
+        subsection_headers.push(header_start..header_end);
+
+        // Skip the entry rows for this subsection.
+        let rows_len = XREF_ENTRY_LEN * header.num_entries as usize;
+        reader.jump(reader.offset() + rows_len);
+    }
+
+    reader.skip_white_spaces();
+    reader.forward_tag(b"trailer")?;
+    reader.skip_white_spaces();
+
+    let trailer_start = reader.offset();
+    let trailer_dict = reader.read_with_context::<Dict<'_>>(&ReaderContext::dummy())?;
+    let trailer_end = trailer_start + trailer_dict.data().len();
+
+    let prev = trailer_dict.get::<i32>(PREV).and_then(|p| {
+        if p >= 0 {
+            Some(p as usize)
+        } else {
+            None
+        }
+    });
+
+    Some((
+        XRefSection {
+            offset: pos,
+            kind: XRefKind::Table,
+            subsection_headers,
+            keyword_offset: pos,
+            end_offset: trailer_end,
+        },
+        prev,
+    ))
+}
+
+/// Scan an xref-stream section. Returns the section metadata and the
+/// `/Prev` offset if present.
+#[cfg(feature = "inspect")]
+fn scan_stream_section(data: &[u8], pos: usize) -> Option<(XRefSection, Option<usize>)> {
+    let layout = crate::layout::scan_indirect_layout(data, pos)?;
+    let end_offset = layout.range.end;
+
+    let mut reader = Reader::new(data);
+    reader.jump(pos);
+    let stream = reader
+        .read_with_context::<IndirectObject<Stream<'_>>>(&ReaderContext::dummy())?
+        .get();
+    let prev = stream.dict().get::<i32>(PREV).and_then(|p| {
+        if p >= 0 {
+            Some(p as usize)
+        } else {
+            None
+        }
+    });
+
+    Some((
+        XRefSection {
+            offset: pos,
+            kind: XRefKind::Stream,
+            subsection_headers: Vec::new(),
+            keyword_offset: pos,
+            end_offset,
+        },
+        prev,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1667,6 +1863,119 @@ mod tests {
         assert!(dummy.entry(ObjectIdentifier::new(1, 0)).is_none());
         assert!(dummy.entries().is_empty());
         assert_eq!(dummy.size(), 0);
+    }
+
+    // --- PR #8: xref sections -------------------------------------------
+
+    #[cfg(feature = "inspect")]
+    #[test]
+    fn sections_for_inline_table() {
+        let bytes = build_pdf(
+            &[
+                "<< /Type /Catalog /Pages 2 0 R >>",
+                "<< /Type /Pages /Kids [] /Count 0 >>",
+            ],
+            "/Root 1 0 R",
+        );
+        let pdf = Pdf::new(bytes).expect("pdf loads");
+        let sections = pdf.xref().sections();
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].kind, XRefKind::Table);
+        assert!(!sections[0].subsection_headers.is_empty());
+        assert!(sections[0].end_offset > sections[0].offset);
+        assert_eq!(sections[0].keyword_offset, sections[0].offset);
+    }
+
+    #[cfg(feature = "inspect")]
+    #[test]
+    fn sections_on_dummy_xref_is_empty() {
+        let dummy = XRef::dummy();
+        assert!(dummy.sections().is_empty());
+    }
+
+    #[cfg(feature = "inspect")]
+    #[test]
+    fn sections_on_real_fixture_has_at_least_one() {
+        let bytes: &[u8] =
+            include_bytes!("../../hayro-tests/pdfs/custom/andler-optimal-lot-size.pdf");
+        let pdf = Pdf::new(bytes.to_vec()).expect("fixture loads");
+        let sections = pdf.xref().sections();
+        assert!(!sections.is_empty());
+        for section in &sections {
+            assert!(section.offset < section.end_offset);
+            assert_eq!(section.keyword_offset, section.offset);
+            if section.kind == XRefKind::Table {
+                assert!(!section.subsection_headers.is_empty());
+            }
+        }
+    }
+
+    #[cfg(feature = "inspect")]
+    #[test]
+    fn sections_for_xref_stream_fixture() {
+        // catalog-in-objstm-aes uses a 1.5+ layout with an xref stream.
+        let bytes: &[u8] =
+            include_bytes!("../../hayro-tests/pdfs/custom/catalog-in-objstm-aes.pdf");
+        let pdf = Pdf::new(bytes.to_vec()).expect("fixture loads");
+        let sections = pdf.xref().sections();
+        assert!(!sections.is_empty());
+        let has_stream = sections.iter().any(|s| s.kind == XRefKind::Stream);
+        assert!(
+            has_stream,
+            "catalog-in-objstm-aes must contain at least one xref stream section"
+        );
+        for section in &sections {
+            if section.kind == XRefKind::Stream {
+                assert!(section.subsection_headers.is_empty());
+            }
+        }
+    }
+
+    #[cfg(feature = "inspect")]
+    #[test]
+    fn sections_incremental_update_most_recent_first() {
+        // Build a PDF with one base section + one update section chained
+        // via /Prev. The updated trailer is placed at the end of the file.
+        let catalog = "<< /Type /Catalog /Pages 2 0 R >>";
+        let pages = "<< /Type /Pages /Kids [] /Count 0 >>";
+
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.7\n");
+        let off1 = pdf.len();
+        pdf.extend_from_slice(format!("1 0 obj\n{catalog}\nendobj\n").as_bytes());
+        let off2 = pdf.len();
+        pdf.extend_from_slice(format!("2 0 obj\n{pages}\nendobj\n").as_bytes());
+
+        // Original xref.
+        let xref_a_pos = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 3\n");
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(b"trailer\n<< /Size 3 /Root 1 0 R >>\n");
+        pdf.extend_from_slice(format!("startxref\n{xref_a_pos}\n%%EOF\n").as_bytes());
+
+        // Incremental update: add object 3, new xref section chained to prev.
+        let off3 = pdf.len();
+        pdf.extend_from_slice(b"3 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+        let xref_b_pos = pdf.len();
+        pdf.extend_from_slice(b"xref\n3 1\n");
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R /Prev {xref_a_pos} >>\n").as_bytes(),
+        );
+        pdf.extend_from_slice(format!("startxref\n{xref_b_pos}\n%%EOF").as_bytes());
+
+        let pdf_obj = Pdf::new(pdf).expect("pdf loads");
+        let sections = pdf_obj.xref().sections();
+        assert_eq!(sections.len(), 2, "{sections:?}");
+        // Most-recent-first: the later xref (higher offset) comes first.
+        assert!(
+            sections[0].offset > sections[1].offset,
+            "sections must be ordered most-recent-first"
+        );
+        assert_eq!(sections[0].kind, XRefKind::Table);
+        assert_eq!(sections[1].kind, XRefKind::Table);
     }
 
     // --- PR #9: indirect layout -----------------------------------------
