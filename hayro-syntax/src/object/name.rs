@@ -14,8 +14,19 @@ use smallvec::SmallVec;
 
 #[derive(Clone)]
 enum NameInner<'a> {
-    Borrowed(&'a [u8]),
-    Owned(SmallVec<[u8; 23]>),
+    /// A name whose PDF source contains no `#` escapes. `source` IS the
+    /// logical (decoded) byte sequence.
+    Borrowed { source: &'a [u8] },
+    /// A name whose PDF source contains one or more `#XX` escape
+    /// sequences. `source` is the pre-decode bytes; `decoded` is the
+    /// escape-expanded byte sequence.
+    Escaped {
+        source: &'a [u8],
+        decoded: SmallVec<[u8; 23]>,
+    },
+    /// A name constructed programmatically, without a PDF source span.
+    /// [`Name::source`] returns an empty slice in this case.
+    Synthetic { decoded: SmallVec<[u8; 23]> },
 }
 
 /// A PDF name object.
@@ -33,8 +44,9 @@ impl<'a> Deref for Name<'a> {
 impl AsRef<[u8]> for Name<'_> {
     fn as_ref(&self) -> &[u8] {
         match &self.0 {
-            NameInner::Borrowed(data) => data,
-            NameInner::Owned(data) => data,
+            NameInner::Borrowed { source } => source,
+            NameInner::Escaped { decoded, .. } => decoded,
+            NameInner::Synthetic { decoded } => decoded,
         }
     }
 }
@@ -85,10 +97,14 @@ impl<'a> Name<'a> {
     /// Create a new name from an unescaped byte sequence.
     #[inline]
     pub fn new_unescaped(data: &'a [u8]) -> Self {
-        Self(NameInner::Borrowed(data))
+        Self(NameInner::Borrowed { source: data })
     }
 
     /// Create a new name from bytes that may contain escape sequences.
+    ///
+    /// The input `data` is the pre-decode source (without the leading
+    /// `/` solidus). The returned [`Name`] retains that slice as its
+    /// source span and decodes `#XX` sequences for the logical value.
     #[inline]
     pub fn new_escaped(data: &'a [u8]) -> Option<Self> {
         let mut result = SmallVec::new();
@@ -103,7 +119,10 @@ impl<'a> Name<'a> {
             }
         }
 
-        Some(Self(NameInner::Owned(result)))
+        Some(Self(NameInner::Escaped {
+            source: data,
+            decoded: result,
+        }))
     }
 
     /// Return a string representation of the name.
@@ -111,6 +130,32 @@ impl<'a> Name<'a> {
     /// Returns a placeholder in case the name is not UTF-8 encoded.
     pub fn as_str(&self) -> &str {
         core::str::from_utf8(self.as_ref()).unwrap_or("{non-ascii key}")
+    }
+
+    /// The raw source bytes of this name, EXCLUDING the leading `/`.
+    ///
+    /// This is the pre-decode form: `#XX` hex escapes are preserved as
+    /// written. Use [`AsRef::as_ref`] / [`Deref`] for the decoded bytes.
+    ///
+    /// For names constructed programmatically without a PDF source
+    /// (see [`Name::from_synthetic`]), returns an empty slice. Every
+    /// `Name` produced via the parse path has a non-empty source.
+    pub fn source(&self) -> &'a [u8] {
+        match &self.0 {
+            NameInner::Borrowed { source } => source,
+            NameInner::Escaped { source, .. } => source,
+            NameInner::Synthetic { .. } => &[],
+        }
+    }
+
+    /// Construct a [`Name`] from owned decoded bytes, with no PDF source
+    /// span. Intended for callers who need a [`Name`] outside of the
+    /// parse path — [`Name::source`] will return an empty slice.
+    #[inline]
+    pub fn from_synthetic(decoded: &[u8]) -> Self {
+        let mut buf: SmallVec<[u8; 23]> = SmallVec::new();
+        buf.extend_from_slice(decoded);
+        Self(NameInner::Synthetic { decoded: buf })
     }
 }
 
@@ -165,7 +210,14 @@ mod tests {
     use crate::object::Name;
     use crate::reader::Reader;
     use crate::reader::ReaderExt;
-    use std::ops::Deref;
+    use alloc::vec::Vec;
+    use core::ops::Deref;
+
+    fn parse(bytes: &[u8]) -> Name<'_> {
+        Reader::new(bytes)
+            .read_without_context::<Name<'_>>()
+            .unwrap()
+    }
 
     #[test]
     fn name_1() {
@@ -198,155 +250,172 @@ mod tests {
 
     #[test]
     fn name_4() {
-        assert_eq!(
-            Reader::new("/Name1".as_bytes())
-                .read_without_context::<Name<'_>>()
-                .unwrap()
-                .deref(),
-            b"Name1"
-        );
+        assert_eq!(parse(b"/Name1").deref(), b"Name1");
     }
 
     #[test]
     fn name_5() {
-        assert_eq!(
-            Reader::new("/ASomewhatLongerName".as_bytes())
-                .read_without_context::<Name<'_>>()
-                .unwrap()
-                .deref(),
-            b"ASomewhatLongerName"
-        );
+        assert_eq!(parse(b"/ASomewhatLongerName").deref(), b"ASomewhatLongerName");
     }
 
     #[test]
     fn name_6() {
         assert_eq!(
-            Reader::new("/A;Name_With-Various***Characters?".as_bytes())
-                .read_without_context::<Name<'_>>()
-                .unwrap()
-                .deref(),
+            parse(b"/A;Name_With-Various***Characters?").deref(),
             b"A;Name_With-Various***Characters?"
         );
     }
 
     #[test]
     fn name_7() {
-        assert_eq!(
-            Reader::new("/1.2".as_bytes())
-                .read_without_context::<Name<'_>>()
-                .unwrap()
-                .deref(),
-            b"1.2"
-        );
+        assert_eq!(parse(b"/1.2").deref(), b"1.2");
     }
 
     #[test]
     fn name_8() {
-        assert_eq!(
-            Reader::new("/$$".as_bytes())
-                .read_without_context::<Name<'_>>()
-                .unwrap()
-                .deref(),
-            b"$$"
-        );
+        assert_eq!(parse(b"/$$").deref(), b"$$");
     }
 
     #[test]
     fn name_9() {
-        assert_eq!(
-            Reader::new("/@pattern".as_bytes())
-                .read_without_context::<Name<'_>>()
-                .unwrap()
-                .deref(),
-            b"@pattern"
-        );
+        assert_eq!(parse(b"/@pattern").deref(), b"@pattern");
     }
 
     #[test]
     fn name_10() {
-        assert_eq!(
-            Reader::new("/.notdef".as_bytes())
-                .read_without_context::<Name<'_>>()
-                .unwrap()
-                .deref(),
-            b".notdef"
-        );
+        assert_eq!(parse(b"/.notdef").deref(), b".notdef");
     }
 
     #[test]
     fn name_11() {
-        assert_eq!(
-            Reader::new("/lime#20Green".as_bytes())
-                .read_without_context::<Name<'_>>()
-                .unwrap()
-                .deref(),
-            b"lime Green"
-        );
+        assert_eq!(parse(b"/lime#20Green").deref(), b"lime Green");
     }
 
     #[test]
     fn name_12() {
         assert_eq!(
-            Reader::new("/paired#28#29parentheses".as_bytes())
-                .read_without_context::<Name<'_>>()
-                .unwrap()
-                .deref(),
+            parse(b"/paired#28#29parentheses").deref(),
             b"paired()parentheses"
         );
     }
 
     #[test]
     fn name_13() {
-        assert_eq!(
-            Reader::new("/The_Key_of_F#23_Minor".as_bytes())
-                .read_without_context::<Name<'_>>()
-                .unwrap()
-                .deref(),
-            b"The_Key_of_F#_Minor"
-        );
+        assert_eq!(parse(b"/The_Key_of_F#23_Minor").deref(), b"The_Key_of_F#_Minor");
     }
 
     #[test]
     fn name_14() {
-        assert_eq!(
-            Reader::new("/A#42".as_bytes())
-                .read_without_context::<Name<'_>>()
-                .unwrap()
-                .deref(),
-            b"AB"
-        );
+        assert_eq!(parse(b"/A#42").deref(), b"AB");
     }
 
     #[test]
     fn name_15() {
-        assert_eq!(
-            Reader::new("/A#3b".as_bytes())
-                .read_without_context::<Name<'_>>()
-                .unwrap()
-                .deref(),
-            b"A;"
-        );
+        assert_eq!(parse(b"/A#3b").deref(), b"A;");
     }
 
     #[test]
     fn name_16() {
-        assert_eq!(
-            Reader::new("/A#3B".as_bytes())
-                .read_without_context::<Name<'_>>()
-                .unwrap()
-                .deref(),
-            b"A;"
-        );
+        assert_eq!(parse(b"/A#3B").deref(), b"A;");
     }
 
     #[test]
     fn name_17() {
-        assert_eq!(
-            Reader::new("/k1  ".as_bytes())
-                .read_without_context::<Name<'_>>()
-                .unwrap()
-                .deref(),
-            b"k1"
-        );
+        assert_eq!(parse(b"/k1  ").deref(), b"k1");
+    }
+
+    // --- PR #6: source accessor --------------------------------------------
+
+    #[test]
+    fn source_for_unescaped_name_equals_decoded() {
+        let name = parse(b"/Hello");
+        assert_eq!(name.source(), b"Hello");
+        assert_eq!(name.as_ref(), b"Hello");
+    }
+
+    #[test]
+    fn source_preserves_lowercase_hex_escape() {
+        // #6c decodes to 'l'; the pre-decode source must keep `#6c` verbatim.
+        let name = parse(b"/Hel#6co");
+        assert_eq!(name.source(), b"Hel#6co");
+        assert_eq!(name.as_ref(), b"Hello");
+    }
+
+    #[test]
+    fn source_preserves_uppercase_hex_escape() {
+        let name = parse(b"/Hel#6Co");
+        assert_eq!(name.source(), b"Hel#6Co");
+        assert_eq!(name.as_ref(), b"Hello");
+    }
+
+    #[test]
+    fn source_preserves_space_escape() {
+        let name = parse(b"/lime#20Green");
+        assert_eq!(name.source(), b"lime#20Green");
+        assert_eq!(name.as_ref(), b"lime Green");
+    }
+
+    #[test]
+    fn source_preserves_paren_escapes() {
+        let name = parse(b"/paired#28#29parentheses");
+        assert_eq!(name.source(), b"paired#28#29parentheses");
+        assert_eq!(name.as_ref(), b"paired()parentheses");
+    }
+
+    #[test]
+    fn source_preserves_hash_escape() {
+        let name = parse(b"/The_Key_of_F#23_Minor");
+        assert_eq!(name.source(), b"The_Key_of_F#23_Minor");
+        assert_eq!(name.as_ref(), b"The_Key_of_F#_Minor");
+    }
+
+    #[test]
+    fn source_for_127_byte_name_succeeds() {
+        // Build `/` + 127 bytes of 'a'.
+        let mut bytes: Vec<u8> = Vec::with_capacity(128);
+        bytes.push(b'/');
+        bytes.extend(core::iter::repeat_n(b'a', 127));
+        let name = parse(&bytes);
+        assert_eq!(name.source().len(), 127);
+        assert_eq!(name.as_ref().len(), 127);
+    }
+
+    #[test]
+    fn source_for_200_byte_unescaped_name_is_permissive() {
+        // ISO 32000-1 §7.3.5 RECOMMENDS ≤ 127 encoded bytes; hayro is
+        // permissive and does not enforce the limit.
+        let mut bytes: Vec<u8> = Vec::with_capacity(201);
+        bytes.push(b'/');
+        bytes.extend(core::iter::repeat_n(b'a', 200));
+        let name = parse(&bytes);
+        assert_eq!(name.source().len(), 200);
+    }
+
+    #[test]
+    fn new_unescaped_exposes_source() {
+        let name = Name::new_unescaped(b"Hi");
+        assert_eq!(name.source(), b"Hi");
+        assert_eq!(name.as_ref(), b"Hi");
+    }
+
+    #[test]
+    fn new_escaped_retains_pre_decode_source() {
+        let name = Name::new_escaped(b"lime#20Green").unwrap();
+        assert_eq!(name.source(), b"lime#20Green");
+        assert_eq!(name.as_ref(), b"lime Green");
+    }
+
+    #[test]
+    fn synthetic_name_has_empty_source() {
+        let name = Name::from_synthetic(b"Synthetic");
+        assert_eq!(name.source(), b"");
+        assert_eq!(name.as_ref(), b"Synthetic");
+    }
+
+    #[test]
+    fn source_bound_to_pdf_slice_not_buffer_end() {
+        // Source must only cover the name token, not trailing bytes.
+        let name = parse(b"/Hi there");
+        assert_eq!(name.source(), b"Hi");
     }
 }
