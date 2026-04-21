@@ -463,6 +463,35 @@ impl XRef {
         }
     }
 
+    /// Return the document's encryption dictionary, if any.
+    ///
+    /// Resolves the trailer's `/Encrypt` entry, following an indirect
+    /// reference where needed. Returns `None` for unencrypted documents,
+    /// for dummy xrefs, and for xrefs reconstructed from a fallback root
+    /// reference (where the original trailer is unavailable).
+    ///
+    /// The accessor reports the presence of `/Encrypt` in the trailer and
+    /// is independent of whether decryption succeeded: a document loaded
+    /// via [`Pdf::new_with_password`] will still report an encryption
+    /// dict here.
+    ///
+    /// # Performance
+    ///
+    /// Re-parses the trailer on each call. See [`XRef::trailer`] for the
+    /// same binding guidance.
+    ///
+    /// [`Pdf::new_with_password`]: crate::Pdf::new_with_password
+    pub fn encryption_dict(&self) -> Option<Dict<'_>> {
+        self.trailer()?.get::<Dict<'_>>(ENCRYPT)
+    }
+
+    /// Whether the document is encrypted.
+    ///
+    /// Equivalent to `self.encryption_dict().is_some()`.
+    pub fn is_encrypted(&self) -> bool {
+        self.encryption_dict().is_some()
+    }
+
     /// Whether the PDF has optional content groups.
     pub fn has_optional_content_groups(&self) -> bool {
         match &self.0 {
@@ -1274,6 +1303,72 @@ mod tests {
         let k1: Vec<Vec<u8>> = first.keys().map(|k| k.as_ref().to_vec()).collect();
         let k2: Vec<Vec<u8>> = second.keys().map(|k| k.as_ref().to_vec()).collect();
         assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn encryption_dict_absent_for_inline_unencrypted_pdf() {
+        let bytes = build_pdf(
+            &[
+                "<< /Type /Catalog /Pages 2 0 R >>",
+                "<< /Type /Pages /Kids [] /Count 0 >>",
+            ],
+            "/Root 1 0 R",
+        );
+        let pdf = Pdf::new(bytes).expect("pdf loads");
+        assert!(!pdf.is_encrypted());
+        assert!(pdf.encryption_dict().is_none());
+    }
+
+    #[test]
+    fn encryption_dict_on_dummy_xref_is_none() {
+        let dummy = XRef::dummy();
+        assert!(!dummy.is_encrypted());
+        assert!(dummy.encryption_dict().is_none());
+    }
+
+    #[test]
+    fn encryption_dict_present_for_aes_128_fixture() {
+        let bytes: &[u8] = include_bytes!("../../hayro-tests/pdfs/custom/encrypted_aes_128.pdf");
+        let pdf = Pdf::new(bytes.to_vec()).expect("aes-128 fixture loads");
+        assert!(pdf.is_encrypted());
+        let enc = pdf.encryption_dict().expect("encryption dict");
+        let filter = enc.get::<Name<'_>>(b"Filter").expect("Filter name");
+        assert_eq!(filter.deref(), b"Standard");
+    }
+
+    #[test]
+    fn encryption_dict_present_for_aes_256_fixture() {
+        let bytes: &[u8] = include_bytes!("../../hayro-tests/pdfs/custom/encrypted_aes_256.pdf");
+        let pdf = Pdf::new(bytes.to_vec()).expect("aes-256 fixture loads");
+        assert!(pdf.is_encrypted());
+        let enc = pdf.encryption_dict().expect("encryption dict");
+        // AES-256 uses V >= 5 and R >= 5 per ISO 32000-2.
+        let v: i32 = enc.get(b"V").expect("V integer");
+        let r: i32 = enc.get(b"R").expect("R integer");
+        assert!(v >= 5, "V = {v}");
+        assert!(r >= 5, "R = {r}");
+    }
+
+    #[test]
+    fn encryption_dict_absent_for_unencrypted_real_fixture() {
+        let bytes: &[u8] =
+            include_bytes!("../../hayro-tests/pdfs/custom/andler-optimal-lot-size.pdf");
+        let pdf = Pdf::new(bytes.to_vec()).expect("fixture loads");
+        assert!(!pdf.is_encrypted());
+        assert!(pdf.encryption_dict().is_none());
+    }
+
+    #[test]
+    fn encryption_dict_present_after_password_decryption() {
+        let bytes: &[u8] =
+            include_bytes!("../../hayro-tests/pdfs/custom/password_encrypted_aes_128.pdf");
+        let pdf = Pdf::new_with_password(bytes.to_vec(), "testpw")
+            .expect("password-protected fixture decrypts");
+        // /Encrypt is still present in the trailer even after successful decryption.
+        assert!(pdf.is_encrypted());
+        let enc = pdf.encryption_dict().expect("encryption dict");
+        let filter = enc.get::<Name<'_>>(b"Filter").expect("Filter name");
+        assert_eq!(filter.deref(), b"Standard");
     }
 
     #[test]
