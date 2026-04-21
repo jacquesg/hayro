@@ -113,6 +113,21 @@ impl Pdf {
     pub fn trailer(&self) -> Option<Dict<'_>> {
         self.xref.trailer()
     }
+
+    /// Return the document's encryption dictionary, if any.
+    ///
+    /// Convenience accessor for [`XRef::encryption_dict`]. See that method
+    /// for behaviour and the re-parse performance note.
+    pub fn encryption_dict(&self) -> Option<Dict<'_>> {
+        self.xref.encryption_dict()
+    }
+
+    /// Whether the document is encrypted.
+    ///
+    /// Convenience accessor for [`XRef::is_encrypted`].
+    pub fn is_encrypted(&self) -> bool {
+        self.xref.is_encrypted()
+    }
 }
 
 fn find_version(data: &[u8]) -> Option<PdfVersion> {
