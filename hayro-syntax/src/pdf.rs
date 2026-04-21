@@ -19,6 +19,7 @@ pub struct Pdf {
     data: PdfData,
     #[cfg(feature = "inspect")]
     layout: crate::sync::OnceLock<crate::layout::FileLayout>,
+    linearization: crate::sync::OnceLock<crate::linearization::CachedLinearization>,
 }
 
 /// An error that occurred while loading a PDF file.
@@ -69,6 +70,7 @@ impl Pdf {
             data,
             #[cfg(feature = "inspect")]
             layout: crate::sync::OnceLock::new(),
+            linearization: crate::sync::OnceLock::new(),
         })
     }
 
@@ -131,6 +133,39 @@ impl Pdf {
     /// Convenience accessor for [`XRef::is_encrypted`].
     pub fn is_encrypted(&self) -> bool {
         self.xref.is_encrypted()
+    }
+
+    fn linearization_cached(&self) -> &crate::linearization::CachedLinearization {
+        self.linearization
+            .get_or_init(|| crate::linearization::detect(&self.xref))
+    }
+
+    /// Return the full state of the linearization parameter dictionary
+    /// (ISO 32000-1 Annex F).
+    ///
+    /// Use this when you need to distinguish an absent dict from a
+    /// malformed one; most callers can use the convenience
+    /// [`Self::linearization`] instead.
+    pub fn linearization_kind(&self) -> crate::linearization::LinearizationKind<'_> {
+        self.linearization_cached().to_kind(&self.xref)
+    }
+
+    /// Return the successfully-parsed linearization parameter dict.
+    ///
+    /// Returns `None` when the document is not linearized OR when its
+    /// linearization dict is malformed. Callers that need to tell the
+    /// two cases apart must use [`Self::linearization_kind`].
+    pub fn linearization(&self) -> Option<&crate::linearization::Linearization> {
+        self.linearization_cached().as_present()
+    }
+
+    /// Whether the document claims linearization.
+    ///
+    /// Returns `true` when the first indirect object has a
+    /// `/Linearized` key, regardless of whether the full parameter dict
+    /// parses successfully.
+    pub fn is_linearized(&self) -> bool {
+        self.linearization_cached().is_linearized()
     }
 
     /// Compute the file-level physical layout.
