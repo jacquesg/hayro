@@ -65,6 +65,48 @@ impl Number {
     pub const fn from_i32(num: i32) -> Self {
         Self(InternalNumber::Integer(num as i64))
     }
+
+    /// Returns the lexical kind of this number.
+    ///
+    /// The kind reflects how the number was written in the source PDF: an
+    /// `Integer` was parsed without a decimal point, whereas a `Real` was
+    /// parsed with one. This distinction is required by downstream
+    /// conformance tooling (for example, PDF/A integer-range checks) that
+    /// must treat `1` and `1.0` differently even though they compare equal
+    /// numerically.
+    #[inline]
+    pub const fn kind(&self) -> NumberKind {
+        match self.0 {
+            InternalNumber::Integer(_) => NumberKind::Integer,
+            InternalNumber::Real(_) => NumberKind::Real,
+        }
+    }
+
+    /// Returns `true` if this number was parsed as an integer literal.
+    #[inline]
+    pub const fn is_integer(&self) -> bool {
+        matches!(self.0, InternalNumber::Integer(_))
+    }
+
+    /// Returns `true` if this number was parsed as a real literal (i.e. it
+    /// contained a decimal point in the source).
+    #[inline]
+    pub const fn is_real(&self) -> bool {
+        matches!(self.0, InternalNumber::Real(_))
+    }
+}
+
+/// The lexical kind of a [`Number`].
+///
+/// Distinguishes between integer literals (e.g. `42`) and real literals
+/// (e.g. `42.0`) as written in the source PDF. See [`Number::kind`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum NumberKind {
+    /// An integer literal — written without a decimal point.
+    Integer,
+    /// A real literal — written with a decimal point.
+    Real,
 }
 
 impl Skippable for Number {
@@ -321,9 +363,113 @@ pub(crate) fn is_digit_or_minus(byte: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::object::Number;
+    use crate::object::{Number, NumberKind};
     use crate::reader::Reader;
     use crate::reader::ReaderExt;
+
+    fn parse(bytes: &[u8]) -> Number {
+        Reader::new(bytes)
+            .read_without_context::<Number>()
+            .expect("number should parse")
+    }
+
+    #[test]
+    fn kind_integer_positive() {
+        let n = parse(b"42");
+        assert_eq!(n.kind(), NumberKind::Integer);
+        assert!(n.is_integer());
+        assert!(!n.is_real());
+    }
+
+    #[test]
+    fn kind_integer_negative() {
+        let n = parse(b"-42");
+        assert_eq!(n.kind(), NumberKind::Integer);
+        assert!(n.is_integer());
+    }
+
+    #[test]
+    fn kind_integer_zero() {
+        let n = parse(b"0");
+        assert_eq!(n.kind(), NumberKind::Integer);
+    }
+
+    #[test]
+    fn kind_integer_signed_zero_dash() {
+        // A lone `-` is treated as zero integer by the lenient parser.
+        let n = parse(b"-");
+        assert_eq!(n.kind(), NumberKind::Integer);
+    }
+
+    #[test]
+    fn kind_integer_dash_dot() {
+        // `-.` is also treated as a zero integer despite the dot, because
+        // the parser falls through to the `has_digits == false` branch which
+        // returns an integer.
+        let n = parse(b"-.");
+        assert_eq!(n.kind(), NumberKind::Integer);
+    }
+
+    #[test]
+    fn kind_real_with_dot() {
+        let n = parse(b"42.0");
+        assert_eq!(n.kind(), NumberKind::Real);
+        assert!(n.is_real());
+        assert!(!n.is_integer());
+    }
+
+    #[test]
+    fn kind_real_leading_dot() {
+        let n = parse(b".5");
+        assert_eq!(n.kind(), NumberKind::Real);
+    }
+
+    #[test]
+    fn kind_real_negative_leading_dot() {
+        let n = parse(b"-.345");
+        assert_eq!(n.kind(), NumberKind::Real);
+    }
+
+    #[test]
+    fn kind_real_trailing_dot() {
+        let n = parse(b"7.");
+        assert_eq!(n.kind(), NumberKind::Real);
+    }
+
+    #[test]
+    fn kind_real_when_value_is_whole() {
+        // Same numeric value as `7` but written with a decimal: must report
+        // `Real`, not `Integer`. This is the core invariant consumers rely on.
+        let integer = parse(b"7");
+        let real = parse(b"7.0");
+        assert_eq!(integer.as_f64(), real.as_f64());
+        assert_eq!(integer.kind(), NumberKind::Integer);
+        assert_eq!(real.kind(), NumberKind::Real);
+    }
+
+    #[test]
+    fn kind_const_constructors() {
+        // `Number::from_i32` yields an integer; `Number::from_f32` yields a real.
+        assert_eq!(Number::from_i32(1).kind(), NumberKind::Integer);
+        assert_eq!(Number::from_f32(1.0).kind(), NumberKind::Real);
+        assert!(Number::ZERO.is_integer());
+        assert!(Number::ONE.is_integer());
+    }
+
+    #[test]
+    fn kind_is_integer_and_is_real_are_mutually_exclusive() {
+        for input in [
+            b"0".as_slice(),
+            b"1".as_slice(),
+            b"-99".as_slice(),
+            b"0.0".as_slice(),
+            b"-0.5".as_slice(),
+            b".25".as_slice(),
+        ] {
+            let n = parse(input);
+            assert_ne!(n.is_integer(), n.is_real(), "input: {input:?}");
+        }
+    }
 
     #[test]
     fn int_1() {

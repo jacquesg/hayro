@@ -6,7 +6,7 @@ pub use crate::object::dict::Dict;
 pub use crate::object::name::Name;
 use crate::object::name::skip_name_like;
 pub use crate::object::null::Null;
-pub use crate::object::number::Number;
+pub use crate::object::number::{Number, NumberKind};
 pub use crate::object::rect::Rect;
 pub use crate::object::r#ref::{MaybeRef, ObjRef};
 pub use crate::object::stream::Stream;
