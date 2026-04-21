@@ -234,6 +234,15 @@ op1!(Shading<'b, 'a>, "sh");
 pub struct XObject<'b, 'a>(pub &'b Name<'a>);
 op1!(XObject<'b, 'a>, "Do");
 
+/// Operator `BI` — begin inline image.
+///
+/// The wrapped `&'b Stream<'a>` carries the image as a self-contained stream: use [`Stream::dict`] for the inline dictionary (width, height, colour space, bits-per-component, filter chain) and [`Stream::raw_data`] for the raw body bytes between the `ID` and `EI` markers. [`Stream::decoded`] runs the declared filter chain.
+///
+/// Inline image dictionaries use abbreviated keys per ISO 32000-1 §8.9.7.1 — e.g. `/W`, `/H`, `/CS`, `/BPC`, `/F`, `/DP`, `/D`, `/IM`, `/I`. Callers should not expand the abbreviations before reading entries.
+///
+/// [`Stream::dict`]: crate::object::Stream::dict
+/// [`Stream::raw_data`]: crate::object::Stream::raw_data
+/// [`Stream::decoded`]: crate::object::Stream::decoded
 #[derive(Debug, PartialEq, Clone)]
 pub struct InlineImage<'b, 'a>(pub &'b Stream<'a>);
 op1!(InlineImage<'b, 'a>, "BI");
@@ -418,6 +427,15 @@ pub enum TypedInstruction<'b, 'a> {
     NonStrokeColorCmyk(NonStrokeColorCmyk),
     Shading(Shading<'b, 'a>),
     XObject(XObject<'b, 'a>),
+    /// Operator `BI` — begin inline image.
+    ///
+    /// The wrapped `&'b Stream<'a>` carries the image as a self-contained stream: use [`Stream::dict`] for the inline dictionary (width, height, colour space, bits-per-component, filter chain) and [`Stream::raw_data`] for the raw body bytes between the `ID` and `EI` markers. [`Stream::decoded`] runs the declared filter chain.
+    ///
+    /// Inline image dictionaries use abbreviated keys per ISO 32000-1 §8.9.7.1 — e.g. `/W`, `/H`, `/CS`, `/BPC`, `/F`, `/DP`, `/D`, `/IM`, `/I`. Callers should not expand the abbreviations before reading entries.
+    ///
+    /// [`Stream::dict`]: crate::object::Stream::dict
+    /// [`Stream::raw_data`]: crate::object::Stream::raw_data
+    /// [`Stream::decoded`]: crate::object::Stream::decoded
     InlineImage(InlineImage<'b, 'a>),
     CharacterSpacing(CharacterSpacing),
     WordSpacing(WordSpacing),

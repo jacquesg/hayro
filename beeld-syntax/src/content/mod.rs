@@ -833,4 +833,38 @@ mod tests {
         assert_eq!(collect_untyped(b""), Vec::new());
         assert_eq!(collect_untyped(b"   \n  "), Vec::new());
     }
+
+    // --- PR #13: inline image access path --------------------------------
+
+    #[test]
+    fn inline_image_dict_and_body_accessible_via_typed_iter() {
+        use crate::content::ops::TypedInstruction;
+
+        let content: &[u8] = b"BI /W 4 /H 1 /CS /G /BPC 8 ID \x00\xff\x00\xff EI";
+        let mut iter = TypedIter::new(content);
+
+        let instr = iter.next().expect("inline image instruction");
+        let inline = match instr {
+            TypedInstruction::InlineImage(i) => i,
+            other => panic!("expected InlineImage, got {other:?}"),
+        };
+
+        let dict = inline.0.dict();
+        assert_eq!(dict.get::<i64>(b"W"), Some(4));
+        assert_eq!(dict.get::<i64>(b"H"), Some(1));
+        assert_eq!(dict.get::<i64>(b"BPC"), Some(8));
+
+        let body = inline.0.raw_data();
+        // The inline-image parser includes a single trailing whitespace
+        // separator before `EI`; accept either representation.
+        let body_bytes = body.as_ref();
+        assert!(
+            body_bytes.starts_with(b"\x00\xff\x00\xff"),
+            "body starts with image bytes, got {body_bytes:?}"
+        );
+        assert!(
+            body_bytes.len() == 4 || (body_bytes.len() == 5 && body_bytes[4].is_ascii_whitespace()),
+            "body has expected length, got {body_bytes:?}"
+        );
+    }
 }

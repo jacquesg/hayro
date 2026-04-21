@@ -72,7 +72,31 @@ ops = {
     "Shading operator": [("sh", "Shading", [Type.Name])],
     "XObject operator": [("Do", "XObject", [Type.Name])],
     "Inline-image operators": [
-        ("BI", "InlineImage", [Type.Stream]),
+        (
+            "BI",
+            "InlineImage",
+            [Type.Stream],
+            (
+                "Operator `BI` — begin inline image.\n"
+                "\n"
+                "The wrapped `&'b Stream<'a>` carries the image as a "
+                "self-contained stream: use [`Stream::dict`] for the "
+                "inline dictionary (width, height, colour space, "
+                "bits-per-component, filter chain) and [`Stream::raw_data`] "
+                "for the raw body bytes between the `ID` and `EI` "
+                "markers. [`Stream::decoded`] runs the declared filter "
+                "chain.\n"
+                "\n"
+                "Inline image dictionaries use abbreviated keys per "
+                "ISO 32000-1 §8.9.7.1 — e.g. `/W`, `/H`, `/CS`, `/BPC`, "
+                "`/F`, `/DP`, `/D`, `/IM`, `/I`. Callers should not "
+                "expand the abbreviations before reading entries.\n"
+                "\n"
+                "[`Stream::dict`]: crate::object::Stream::dict\n"
+                "[`Stream::raw_data`]: crate::object::Stream::raw_data\n"
+                "[`Stream::decoded`]: crate::object::Stream::decoded"
+            ),
+        ),
         # We do not emit ID and EI in the parser.
         # ("ID", "BeginInlineImageData", []),
         # ("EI", "EndInlineImage", []),
@@ -142,11 +166,14 @@ def lifetime_if_needed(types):
     )
 
 
-def gen_struct(name, code, types):
+def gen_struct(name, code, types, docs=None):
     lifetime = lifetime_if_needed(types)
     count = len(types)
     macro_suffix = count
-    struct = [f"#[derive(Debug, PartialEq, Clone)]"]
+    struct = []
+    if docs:
+        struct += [f"/// {line}" if line else "///" for line in docs.splitlines()]
+    struct.append("#[derive(Debug, PartialEq, Clone)]")
     if count == 0:
         struct.append(f"pub struct {name};")
     elif count == 1:
@@ -163,13 +190,23 @@ def gen_struct(name, code, types):
     return "\n".join(struct)
 
 
-def gen_enum_variant(name, types):
+def gen_enum_variant(name, types, docs=None):
     has_lifetime = name in ["StrokeColorNamed", "NonStrokeColorNamed"] or (
         (type(types) is list)
         and any(t in [Type.Array, Type.Object, Type.Stream, Type.Name, Type.String] for t in types)
     )
     inner_type = f"{name}<'b, 'a>" if has_lifetime else name
-    return f"{name}({inner_type})"
+    base = f"{name}({inner_type})"
+    if not docs:
+        return base
+    # Leading `    ` indent on the first variant comes from the enum-block
+    # template; subsequent lines (further doc lines + the variant itself)
+    # must carry their own `    ` indent.
+    lines = docs.splitlines()
+    first = f"/// {lines[0]}" if lines[0] else "///"
+    rest = [f"    /// {line}" if line else "    ///" for line in lines[1:]]
+    rest.append(f"    {base}")
+    return first + "\n" + "\n".join(rest)
 
 
 def gen_dispatch_match(code, name, types):
@@ -183,10 +220,15 @@ enum_variants = []
 dispatch_arms = []
 
 for category in ops.values():
-    for code, name, types in category:
+    for entry in category:
+        if len(entry) == 4:
+            code, name, types, docs = entry
+        else:
+            code, name, types = entry
+            docs = None
         if type(types) is list:
-            structs.append(gen_struct(name, code, types))
-        enum_variants.append(gen_enum_variant(name, types))
+            structs.append(gen_struct(name, code, types, docs))
+        enum_variants.append(gen_enum_variant(name, types, docs))
         dispatch_arms.append(gen_dispatch_match(code, name, types))
 
 # Build the final Rust code blocks
