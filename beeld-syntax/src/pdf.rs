@@ -1,7 +1,7 @@
 //! The starting point for reading PDF files.
 
 use crate::PdfData;
-use crate::object::Object;
+use crate::object::{Dict, Object};
 use crate::page::Pages;
 use crate::page::cached::CachedPages;
 use crate::reader::Reader;
@@ -104,6 +104,14 @@ impl Pdf {
     /// Return the metadata in the document information dictionary of the document.
     pub fn metadata(&self) -> &Metadata {
         self.xref.metadata()
+    }
+
+    /// Return the document's trailer dictionary.
+    ///
+    /// Convenience accessor for [`XRef::trailer`]. See that method for
+    /// behaviour and the re-parse performance note.
+    pub fn trailer(&self) -> Option<Dict<'_>> {
+        self.xref.trailer()
     }
 }
 
