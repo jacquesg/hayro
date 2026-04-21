@@ -95,6 +95,7 @@ pub mod content;
 mod crypto;
 #[cfg(feature = "inspect")]
 pub mod layout;
+pub mod linearization;
 pub mod metadata;
 pub mod object;
 pub mod page;

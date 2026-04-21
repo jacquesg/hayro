@@ -446,6 +446,38 @@ impl XRef {
         }
     }
 
+    /// Return the trailer dictionary of the first-page xref section in
+    /// a linearized document.
+    ///
+    /// Returns `None` for non-linearized documents, for dummy xrefs, or
+    /// when the first-page trailer cannot be located. The first-page
+    /// trailer is the dict immediately preceding the first `%%EOF`
+    /// marker in the file (ISO 32000-1 Annex F.4.5).
+    ///
+    /// Requires the `inspect` feature because it uses `FileLayout`
+    /// EOF offsets.
+    #[cfg(feature = "inspect")]
+    pub fn first_page_trailer(&self) -> Option<Dict<'_>> {
+        let repr = match &self.0 {
+            Inner::Dummy => return None,
+            Inner::Some(r) => r,
+        };
+        let data = repr.data.get().as_ref();
+
+        let layout = crate::layout::FileLayout::compute(data);
+        let first_eof = *layout.eof_offsets.first()?;
+
+        // Within [0, first_eof), find the last `trailer` keyword.
+        let scan_area = data.get(..first_eof)?;
+        let trailer_keyword = b"trailer";
+        let trailer_rel = rfind_subslice(scan_area, trailer_keyword)?;
+        let dict_start = trailer_rel + trailer_keyword.len();
+        let mut reader = Reader::new(data);
+        reader.jump(dict_start);
+        reader.skip_white_spaces_and_comments();
+        reader.read_with_context::<Dict<'_>>(&ReaderContext::new(self, false))
+    }
+
     /// Return all cross-reference sections, ordered most-recent-first.
     ///
     /// The sections are discovered by walking the file's `startxref`
@@ -848,6 +880,18 @@ pub(crate) enum XRefInput<'a> {
     /// Note that this won't work if the document is encrypted, as we
     /// can't access the crypto dictionary.
     RootRef(ObjectIdentifier),
+}
+
+/// Return the byte offset of the last occurrence of `needle` in
+/// `haystack`, or `None` if not present.
+#[cfg(feature = "inspect")]
+fn rfind_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    (0..=haystack.len() - needle.len())
+        .rev()
+        .find(|&i| &haystack[i..i + needle.len()] == needle)
 }
 
 pub(crate) fn find_last_xref_pos(data: &[u8]) -> Option<usize> {
