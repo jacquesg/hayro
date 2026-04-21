@@ -7,23 +7,75 @@ use crate::object::macros::object;
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 use crate::trivia::is_white_space_character;
-use alloc::vec::Vec;
+use alloc::borrow::Cow;
 use core::borrow::Borrow;
 use core::hash::{Hash, Hasher};
 use core::ops::Deref;
 use smallvec::SmallVec;
 
-#[derive(Clone)]
-enum StringInner<'a> {
-    Borrowed(&'a [u8]),
-    Owned(SmallVec<[u8; 23]>),
+/// Lexical form of a PDF [`String`] as it appeared in source.
+///
+/// ISO 32000-1 §7.3.4 defines two string forms. A consumer that cares
+/// about source-level constraints — diagnostics, byte-length limits
+/// before decoding, or round-trip rewriting — uses this to discriminate
+/// between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum StringKind {
+    /// `(…)` literal string.
+    Literal,
+    /// `<…>` hexadecimal string.
+    Hex,
 }
 
-impl AsRef<[u8]> for StringInner<'_> {
-    fn as_ref(&self) -> &[u8] {
+#[derive(Clone)]
+enum StringInner<'a> {
+    /// A literal `(…)` string. `source` is the bytes between the
+    /// parentheses; `decoded` is the escape-expanded value, `Cow::Borrowed`
+    /// when the source needs no escape processing.
+    Literal {
+        source: &'a [u8],
+        decoded: Cow<'a, [u8]>,
+    },
+    /// A hex `<…>` string. `source` is the bytes between the angle
+    /// brackets (whitespace preserved); `decoded` is the decoded bytes.
+    Hex {
+        source: &'a [u8],
+        decoded: Cow<'a, [u8]>,
+    },
+    /// Produced by decryption of a literal or hex ciphertext. `source`
+    /// is the CIPHERTEXT bytes as they appeared in the PDF (between
+    /// the `(…)` or `<…>` delimiters, pre-decryption). `kind` is the
+    /// lexical form of that ciphertext container. `decoded` is the
+    /// post-decryption plaintext.
+    Decrypted {
+        source: &'a [u8],
+        kind: StringKind,
+        decoded: SmallVec<[u8; 23]>,
+    },
+}
+
+impl<'a> StringInner<'a> {
+    fn decoded(&self) -> &[u8] {
         match self {
-            Self::Borrowed(data) => data,
-            Self::Owned(data) => data,
+            Self::Literal { decoded, .. } | Self::Hex { decoded, .. } => decoded,
+            Self::Decrypted { decoded, .. } => decoded,
+        }
+    }
+
+    fn source(&self) -> &'a [u8] {
+        match *self {
+            Self::Literal { source, .. }
+            | Self::Hex { source, .. }
+            | Self::Decrypted { source, .. } => source,
+        }
+    }
+
+    fn kind(&self) -> StringKind {
+        match self {
+            Self::Literal { .. } => StringKind::Literal,
+            Self::Hex { .. } => StringKind::Hex,
+            Self::Decrypted { kind, .. } => *kind,
         }
     }
 }
@@ -37,6 +89,29 @@ impl<'a> String<'a> {
     pub fn as_bytes(&self) -> &[u8] {
         self.as_ref()
     }
+
+    /// The lexical kind of this string as it appeared in source.
+    ///
+    /// For strings whose [`as_bytes`](Self::as_bytes) value is the result
+    /// of decryption, this reports the lexical form of the ciphertext
+    /// container (the `(…)` or `<…>` wrapper around the encrypted
+    /// bytes).
+    pub fn kind(&self) -> StringKind {
+        self.0.kind()
+    }
+
+    /// The raw source bytes of this string, EXCLUDING the delimiters.
+    ///
+    /// For a literal string `(Hello\n)` this returns `b"Hello\\n"`
+    /// — the backslash-escape is left uninterpreted. For a hex string
+    /// `<48656C 6C6F>` this returns `b"48656C 6C6F"` — whitespace is
+    /// preserved. For a decrypted string this returns the CIPHERTEXT
+    /// bytes as they appeared in the PDF source, NOT the decrypted
+    /// plaintext; call [`as_bytes`](Self::as_bytes) for the decoded
+    /// value.
+    pub fn source(&self) -> &'a [u8] {
+        self.0.source()
+    }
 }
 
 impl Deref for String<'_> {
@@ -49,10 +124,7 @@ impl Deref for String<'_> {
 
 impl AsRef<[u8]> for String<'_> {
     fn as_ref(&self) -> &[u8] {
-        match &self.0 {
-            StringInner::Borrowed(data) => data,
-            StringInner::Owned(data) => data,
-        }
+        self.0.decoded()
     }
 }
 
@@ -96,33 +168,35 @@ impl Skippable for String<'_> {
 
 impl<'a> Readable<'a> for String<'a> {
     fn read(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
-        let decoded = match r.peek_byte()? {
-            b'<' => StringInner::Owned(read_hex(r)?),
+        let inner = match r.peek_byte()? {
+            b'<' => read_hex(r)?,
             b'(' => read_literal(r)?,
             _ => return None,
         };
 
         // Apply decryption if needed.
-        let final_data = if ctx.xref().needs_decryption(ctx) {
+        let final_inner = if ctx.xref().needs_decryption(ctx) {
             if let Some(obj_number) = ctx.obj_number() {
-                ctx.xref()
-                    .decrypt(obj_number, decoded.as_ref(), DecryptionTarget::String)
-                    .map(StringInner::from)
-                    .unwrap_or(decoded)
+                match ctx.xref().decrypt(
+                    obj_number,
+                    inner.decoded(),
+                    DecryptionTarget::String,
+                ) {
+                    Some(plaintext) => StringInner::Decrypted {
+                        source: inner.source(),
+                        kind: inner.kind(),
+                        decoded: SmallVec::from_vec(plaintext),
+                    },
+                    None => inner,
+                }
             } else {
-                decoded
+                inner
             }
         } else {
-            decoded
+            inner
         };
 
-        Some(Self(final_data))
-    }
-}
-
-impl From<Vec<u8>> for StringInner<'_> {
-    fn from(value: Vec<u8>) -> Self {
-        Self::Owned(SmallVec::from_vec(value))
+        Some(Self(final_inner))
     }
 }
 
@@ -143,16 +217,19 @@ fn skip_hex(r: &mut Reader<'_>) -> Option<()> {
     Some(())
 }
 
-fn read_hex(r: &mut Reader<'_>) -> Option<SmallVec<[u8; 23]>> {
+fn read_hex<'a>(r: &mut Reader<'a>) -> Option<StringInner<'a>> {
     let start = r.offset();
     skip_hex(r)?;
     let end = r.offset();
 
     // Exclude outer brackets.
-    let raw = r.range(start + 1..end - 1)?;
-    let decoded = ascii_hex::decode_into(raw)?;
+    let source = r.range(start + 1..end - 1)?;
+    let decoded: SmallVec<[u8; 23]> = ascii_hex::decode_into(source)?;
 
-    Some(decoded)
+    Some(StringInner::Hex {
+        source,
+        decoded: Cow::Owned(decoded.into_vec()),
+    })
 }
 
 fn skip_literal(r: &mut Reader<'_>) -> Option<()> {
@@ -181,14 +258,17 @@ fn read_literal<'a>(r: &mut Reader<'a>) -> Option<StringInner<'a>> {
     let end = r.offset();
 
     // Exclude outer parentheses.
-    let data = r.range(start + 1..end - 1)?;
+    let source = r.range(start + 1..end - 1)?;
 
-    if !data.iter().any(|b| matches!(b, b'\\' | b'\n' | b'\r')) {
-        return Some(StringInner::Borrowed(data));
+    if !source.iter().any(|b| matches!(b, b'\\' | b'\n' | b'\r')) {
+        return Some(StringInner::Literal {
+            source,
+            decoded: Cow::Borrowed(source),
+        });
     }
 
-    let mut r = Reader::new(data);
-    let mut result = SmallVec::new();
+    let mut r = Reader::new(source);
+    let mut result: SmallVec<[u8; 23]> = SmallVec::new();
 
     while let Some(byte) = r.read_byte() {
         match byte {
@@ -264,7 +344,10 @@ fn read_literal<'a>(r: &mut Reader<'a>) -> Option<StringInner<'a>> {
         }
     }
 
-    Some(StringInner::Owned(result))
+    Some(StringInner::Literal {
+        source,
+        decoded: Cow::Owned(result.into_vec()),
+    })
 }
 
 fn is_octal_digit(byte: u8) -> bool {
@@ -273,39 +356,30 @@ fn is_octal_digit(byte: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::object::String;
+    use crate::object::{String, string::StringKind};
     use crate::reader::Reader;
     use crate::reader::ReaderExt;
 
+    fn parse(bytes: &[u8]) -> String<'_> {
+        Reader::new(bytes)
+            .read_without_context::<String<'_>>()
+            .unwrap()
+    }
+
     #[test]
     fn hex_string_empty() {
-        assert_eq!(
-            Reader::new(b"<>")
-                .read_without_context::<String<'_>>()
-                .unwrap()
-                .as_bytes(),
-            b""
-        );
+        assert_eq!(parse(b"<>").as_bytes(), b"");
     }
 
     #[test]
     fn hex_string_1() {
-        assert_eq!(
-            Reader::new(b"<00010203>")
-                .read_without_context::<String<'_>>()
-                .unwrap()
-                .as_bytes(),
-            &[0x00, 0x01, 0x02, 0x03]
-        );
+        assert_eq!(parse(b"<00010203>").as_bytes(), &[0x00, 0x01, 0x02, 0x03]);
     }
 
     #[test]
     fn hex_string_2() {
         assert_eq!(
-            Reader::new(b"<000102034>")
-                .read_without_context::<String<'_>>()
-                .unwrap()
-                .as_bytes(),
+            parse(b"<000102034>").as_bytes(),
             &[0x00, 0x01, 0x02, 0x03, 0x40]
         );
     }
@@ -313,34 +387,19 @@ mod tests {
     #[test]
     fn hex_string_trailing_1() {
         assert_eq!(
-            Reader::new(b"<000102034>dfgfg4")
-                .read_without_context::<String<'_>>()
-                .unwrap()
-                .as_bytes(),
+            parse(b"<000102034>dfgfg4").as_bytes(),
             &[0x00, 0x01, 0x02, 0x03, 0x40]
         );
     }
 
     #[test]
     fn hex_string_trailing_2() {
-        assert_eq!(
-            Reader::new(b"<1  3 4>dfgfg4")
-                .read_without_context::<String<'_>>()
-                .unwrap()
-                .as_bytes(),
-            &[0x13, 0x40]
-        );
+        assert_eq!(parse(b"<1  3 4>dfgfg4").as_bytes(), &[0x13, 0x40]);
     }
 
     #[test]
     fn hex_string_trailing_3() {
-        assert_eq!(
-            Reader::new(b"<1>dfgfg4")
-                .read_without_context::<String<'_>>()
-                .unwrap()
-                .as_bytes(),
-            &[0x10]
-        );
+        assert_eq!(parse(b"<1>dfgfg4").as_bytes(), &[0x10]);
     }
 
     #[test]
@@ -363,24 +422,12 @@ mod tests {
 
     #[test]
     fn literal_string_empty() {
-        assert_eq!(
-            Reader::new(b"()")
-                .read_without_context::<String<'_>>()
-                .unwrap()
-                .as_bytes(),
-            b""
-        );
+        assert_eq!(parse(b"()").as_bytes(), b"");
     }
 
     #[test]
     fn literal_string_1() {
-        assert_eq!(
-            Reader::new(b"(Hi there.)")
-                .read_without_context::<String<'_>>()
-                .unwrap()
-                .as_bytes(),
-            b"Hi there."
-        );
+        assert_eq!(parse(b"(Hi there.)").as_bytes(), b"Hi there.");
     }
 
     #[test]
@@ -394,155 +441,200 @@ mod tests {
 
     #[test]
     fn literal_string_3() {
-        assert_eq!(
-            Reader::new(b"(Hi ) there.)")
-                .read_without_context::<String<'_>>()
-                .unwrap()
-                .as_bytes(),
-            b"Hi "
-        );
+        assert_eq!(parse(b"(Hi ) there.)").as_bytes(), b"Hi ");
     }
 
     #[test]
     fn literal_string_4() {
-        assert_eq!(
-            Reader::new(b"(Hi (()) there)")
-                .read_without_context::<String<'_>>()
-                .unwrap()
-                .as_bytes(),
-            b"Hi (()) there"
-        );
+        assert_eq!(parse(b"(Hi (()) there)").as_bytes(), b"Hi (()) there");
     }
 
     #[test]
     fn literal_string_5() {
-        assert_eq!(
-            Reader::new(b"(Hi \\()")
-                .read_without_context::<String<'_>>()
-                .unwrap()
-                .as_bytes(),
-            b"Hi ("
-        );
+        assert_eq!(parse(b"(Hi \\()").as_bytes(), b"Hi (");
     }
 
     #[test]
     fn literal_string_6() {
-        assert_eq!(
-            Reader::new(b"(Hi \\\nthere)")
-                .read_without_context::<String<'_>>()
-                .unwrap()
-                .as_bytes(),
-            b"Hi there"
-        );
+        assert_eq!(parse(b"(Hi \\\nthere)").as_bytes(), b"Hi there");
     }
 
     #[test]
     fn literal_string_7() {
-        assert_eq!(
-            Reader::new(b"(Hi \\05354)")
-                .read_without_context::<String<'_>>()
-                .unwrap()
-                .as_bytes(),
-            b"Hi +54"
-        );
+        assert_eq!(parse(b"(Hi \\05354)").as_bytes(), b"Hi +54");
     }
 
     #[test]
     fn literal_string_8() {
-        assert_eq!(
-            Reader::new(b"(\\3)")
-                .read_without_context::<String<'_>>()
-                .unwrap()
-                .as_bytes(),
-            b"\x03"
-        );
+        assert_eq!(parse(b"(\\3)").as_bytes(), b"\x03");
     }
 
     #[test]
     fn literal_string_9() {
-        assert_eq!(
-            Reader::new(b"(\\36)")
-                .read_without_context::<String<'_>>()
-                .unwrap()
-                .as_bytes(),
-            b"\x1e"
-        );
+        assert_eq!(parse(b"(\\36)").as_bytes(), b"\x1e");
     }
 
     #[test]
     fn literal_string_10() {
-        assert_eq!(
-            Reader::new(b"(\\36ab)")
-                .read_without_context::<String<'_>>()
-                .unwrap()
-                .as_bytes(),
-            b"\x1eab"
-        );
+        assert_eq!(parse(b"(\\36ab)").as_bytes(), b"\x1eab");
     }
 
     #[test]
     fn literal_string_11() {
-        assert_eq!(
-            Reader::new(b"(\\00Y)")
-                .read_without_context::<String<'_>>()
-                .unwrap()
-                .as_bytes(),
-            b"\0Y"
-        );
+        assert_eq!(parse(b"(\\00Y)").as_bytes(), b"\0Y");
     }
 
     #[test]
     fn literal_string_12() {
-        assert_eq!(
-            Reader::new(b"(\\0Y)")
-                .read_without_context::<String<'_>>()
-                .unwrap()
-                .as_bytes(),
-            b"\0Y"
-        );
+        assert_eq!(parse(b"(\\0Y)").as_bytes(), b"\0Y");
     }
 
     #[test]
     fn literal_string_trailing() {
-        assert_eq!(
-            Reader::new(b"(Hi there.)abcde")
-                .read_without_context::<String<'_>>()
-                .unwrap()
-                .as_bytes(),
-            b"Hi there."
-        );
+        assert_eq!(parse(b"(Hi there.)abcde").as_bytes(), b"Hi there.");
     }
 
     #[test]
     fn literal_string_invalid() {
-        assert_eq!(
-            Reader::new(b"(Hi \\778)")
-                .read_without_context::<String<'_>>()
-                .unwrap()
-                .as_bytes(),
-            b"Hi \x3F8"
-        );
+        assert_eq!(parse(b"(Hi \\778)").as_bytes(), b"Hi \x3F8");
     }
 
     #[test]
     fn string_1() {
-        assert_eq!(
-            Reader::new(b"(Hi there.)")
-                .read_without_context::<String<'_>>()
-                .unwrap()
-                .as_bytes(),
-            b"Hi there."
-        );
+        assert_eq!(parse(b"(Hi there.)").as_bytes(), b"Hi there.");
     }
 
     #[test]
     fn string_2() {
-        assert_eq!(
-            Reader::new(b"<00010203>")
-                .read_without_context::<String<'_>>()
-                .unwrap()
-                .as_bytes(),
-            &[0x00, 0x01, 0x02, 0x03]
+        assert_eq!(parse(b"<00010203>").as_bytes(), &[0x00, 0x01, 0x02, 0x03]);
+    }
+
+    // --- PR #5: source/kind accessors ----------------------------------
+
+    #[test]
+    fn kind_and_source_for_unescaped_literal() {
+        let s = parse(b"(Hello)");
+        assert_eq!(s.kind(), StringKind::Literal);
+        assert_eq!(s.source(), b"Hello");
+        assert_eq!(s.as_bytes(), b"Hello");
+    }
+
+    #[test]
+    fn source_preserves_literal_escapes_uninterpreted() {
+        let s = parse(b"(He\\llo)");
+        assert_eq!(s.kind(), StringKind::Literal);
+        assert_eq!(s.source(), b"He\\llo");
+        assert_eq!(s.as_bytes(), b"Hello");
+    }
+
+    #[test]
+    fn source_preserves_line_splice_escape_uninterpreted() {
+        let s = parse(b"(Hi \\\nthere)");
+        assert_eq!(s.kind(), StringKind::Literal);
+        assert_eq!(s.source(), b"Hi \\\nthere");
+        assert_eq!(s.as_bytes(), b"Hi there");
+    }
+
+    #[test]
+    fn kind_and_source_for_hex() {
+        let s = parse(b"<48656C6C6F>");
+        assert_eq!(s.kind(), StringKind::Hex);
+        assert_eq!(s.source(), b"48656C6C6F");
+        assert_eq!(s.as_bytes(), b"Hello");
+    }
+
+    #[test]
+    fn odd_length_hex_source_preserved() {
+        // PDF §7.3.4.3: if the final hex digit is missing, it is
+        // treated as 0. `414` -> `4140` -> [0x41, 0x40].
+        let s = parse(b"<414>");
+        assert_eq!(s.kind(), StringKind::Hex);
+        assert_eq!(s.source(), b"414");
+        assert_eq!(s.as_bytes(), &[0x41, 0x40]);
+    }
+
+    #[test]
+    fn hex_whitespace_preserved_in_source() {
+        let s = parse(b"<48 65 6C 6C 6F>");
+        assert_eq!(s.kind(), StringKind::Hex);
+        assert_eq!(s.source(), b"48 65 6C 6C 6F");
+        assert_eq!(s.as_bytes(), b"Hello");
+    }
+
+    #[test]
+    fn source_reports_span_inside_larger_buffer() {
+        // Make sure offsets are bound by the delimiters, not the buffer.
+        let s = parse(b"(Hi)xyz");
+        assert_eq!(s.source(), b"Hi");
+    }
+
+    #[test]
+    fn decrypted_string_source_is_ciphertext() {
+        use crate::Pdf;
+        use crate::object::{Dict, Object};
+        use alloc::vec::Vec;
+
+        let bytes: &[u8] = include_bytes!("../../../hayro-tests/pdfs/custom/encrypted_aes_128.pdf");
+        let pdf = Pdf::new(bytes.to_vec()).expect("fixture loads");
+
+        fn walk_object<'a>(obj: &Object<'a>, out: &mut Vec<String<'a>>) {
+            match obj {
+                Object::String(s) => out.push(s.clone()),
+                Object::Array(a) => {
+                    for item in a.iter::<Object<'_>>() {
+                        walk_object(&item, out);
+                    }
+                }
+                Object::Dict(d) => walk_dict(d, out),
+                Object::Stream(s) => walk_dict(s.dict(), out),
+                _ => {}
+            }
+        }
+
+        fn walk_dict<'a>(d: &Dict<'a>, out: &mut Vec<String<'a>>) {
+            let keys: Vec<Vec<u8>> = d.keys().map(|k| k.as_ref().to_vec()).collect();
+            for key in keys {
+                if let Some(v) = d.get::<Object<'_>>(&key) {
+                    walk_object(&v, out);
+                }
+            }
+        }
+
+        let mut strings: Vec<String<'_>> = Vec::new();
+        for object in pdf.objects() {
+            walk_object(&object, &mut strings);
+        }
+
+        assert!(
+            !strings.is_empty(),
+            "encrypted fixture must expose at least one String object"
         );
+
+        let mut found_ciphertext_differs = false;
+        let mut found_any_non_empty = false;
+        for s in &strings {
+            if s.as_bytes().is_empty() {
+                continue;
+            }
+            found_any_non_empty = true;
+            if s.source() != s.as_bytes() {
+                found_ciphertext_differs = true;
+                break;
+            }
+        }
+        assert!(found_any_non_empty, "no non-empty decrypted string in fixture");
+        assert!(
+            found_ciphertext_differs,
+            "expected at least one decrypted string whose ciphertext source \
+             differs from its plaintext bytes"
+        );
+    }
+
+    #[test]
+    fn object_size_regression() {
+        // Retaining source spans + lexical kind widens String<'_>. Lock the
+        // new size so surprise growth is caught.
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(size_of::<String<'_>>(), 56);
     }
 }
