@@ -386,7 +386,7 @@ mod tests {
         assert_eq!(size_of::<Object<'_>>(), 56);
         assert_eq!(size_of::<Array<'_>>(), 32);
         assert_eq!(size_of::<Dict<'_>>(), 8);
-        assert_eq!(size_of::<Name<'_>>(), 32);
+        assert_eq!(size_of::<Name<'_>>(), 48);
         assert_eq!(size_of::<Null>(), 0);
         assert_eq!(size_of::<Number>(), 16);
         assert_eq!(size_of::<Stream<'_>>(), 24);
