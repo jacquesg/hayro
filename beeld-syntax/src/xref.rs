@@ -550,6 +550,15 @@ impl XRef {
         max(from_trailer.unwrap_or(0), from_map)
     }
 
+    /// Return the raw PDF source bytes backing this xref, if any.
+    #[cfg(feature = "inspect")]
+    pub(crate) fn data_bytes(&self) -> Option<&[u8]> {
+        match &self.0 {
+            Inner::Dummy => None,
+            Inner::Some(r) => Some(r.data.get().as_ref()),
+        }
+    }
+
     pub(crate) fn trailer_data(&self) -> &TrailerData {
         match &self.0 {
             Inner::Dummy => unreachable!(),
