@@ -120,6 +120,20 @@ impl Pdf {
         self.xref.trailer()
     }
 
+    /// Return the trailer dictionary pinned by `startxref`.
+    ///
+    /// Convenience accessor for [`XRef::latest_trailer`]. See that
+    /// method for semantics — in particular, for a linearised document
+    /// this differs from [`Self::trailer`] because `startxref` points
+    /// at the first-page xref section while `/Prev` reaches the main
+    /// xref at the tail.
+    ///
+    /// Requires the `inspect` feature.
+    #[cfg(feature = "inspect")]
+    pub fn latest_trailer(&self) -> Option<Dict<'_>> {
+        self.xref.latest_trailer()
+    }
+
     /// Return the document's encryption dictionary, if any.
     ///
     /// Convenience accessor for [`XRef::encryption_dict`]. See that method

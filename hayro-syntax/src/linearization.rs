@@ -403,5 +403,121 @@ mod tests {
         // distinction is provided by `is_linearized()`.
         let _ = pdf.xref().first_page_trailer(); // exercise the path
     }
+
+    /// Build a minimal PDF that carries two xref sections chained via
+    /// `/Prev`. The trailing section (pinned by `startxref`) and the
+    /// base section advertise distinct `/ID` arrays so that tests can
+    /// tell `trailer()` from `latest_trailer()`.
+    #[cfg(feature = "inspect")]
+    fn build_incremental_pdf_with_distinct_ids() -> Vec<u8> {
+        let catalog = "<< /Type /Catalog /Pages 2 0 R >>";
+        let pages = "<< /Type /Pages /Kids [] /Count 0 >>";
+
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.7\n");
+        let off1 = pdf.len();
+        pdf.extend_from_slice(format!("1 0 obj\n{catalog}\nendobj\n").as_bytes());
+        let off2 = pdf.len();
+        pdf.extend_from_slice(format!("2 0 obj\n{pages}\nendobj\n").as_bytes());
+
+        // Base xref with /ID = [<AAAA> <BBBB>].
+        let xref_a_pos = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 3\n");
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            b"trailer\n<< /Size 3 /Root 1 0 R /ID [<AAAA> <BBBB>] >>\n",
+        );
+        pdf.extend_from_slice(format!("startxref\n{xref_a_pos}\n%%EOF\n").as_bytes());
+
+        // Incremental update: add obj 3, chained via /Prev to xref_a_pos.
+        let off3 = pdf.len();
+        pdf.extend_from_slice(b"3 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+        let xref_b_pos = pdf.len();
+        pdf.extend_from_slice(b"xref\n3 1\n");
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 4 /Root 1 0 R /Prev {xref_a_pos} \
+                 /ID [<CCCC> <DDDD>] >>\n"
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(format!("startxref\n{xref_b_pos}\n%%EOF").as_bytes());
+        pdf
+    }
+
+    #[cfg(feature = "inspect")]
+    #[test]
+    fn latest_trailer_returns_terminus_of_prev_chain() {
+        use crate::object::Array;
+        use crate::object::String as PdfString;
+
+        let bytes = build_incremental_pdf_with_distinct_ids();
+        let pdf = Pdf::new(bytes).expect("pdf loads");
+
+        // trailer() is pinned at startxref (the most-recent update
+        // section, with /ID = [<CCCC> <DDDD>]).
+        let startxref_trailer = pdf.trailer().expect("startxref trailer");
+        let startxref_id_first = startxref_trailer
+            .get::<Array<'_>>(b"ID")
+            .and_then(|a| a.flex_iter().next::<PdfString<'_>>())
+            .expect("update /ID[0]");
+        assert_eq!(startxref_id_first.as_ref(), &[0xCC, 0xCC]);
+
+        // latest_trailer() walks /Prev to the terminus (the base
+        // section, with /ID = [<AAAA> <BBBB>]).
+        let latest = pdf.latest_trailer().expect("latest trailer");
+        let latest_id_first = latest
+            .get::<Array<'_>>(b"ID")
+            .and_then(|a| a.flex_iter().next::<PdfString<'_>>())
+            .expect("base /ID[0]");
+        assert_eq!(latest_id_first.as_ref(), &[0xAA, 0xAA]);
+    }
+
+    #[cfg(feature = "inspect")]
+    #[test]
+    fn latest_trailer_equals_trailer_for_single_section() {
+        let pdf = Pdf::new(build_non_linearized()).expect("pdf loads");
+        let a: i32 = pdf.trailer().expect("trailer").get(b"Size").expect("Size");
+        let b: i32 = pdf
+            .latest_trailer()
+            .expect("latest trailer")
+            .get(b"Size")
+            .expect("Size");
+        assert_eq!(a, b);
+    }
+
+    #[cfg(feature = "inspect")]
+    #[test]
+    fn latest_trailer_for_linearized_fixture_differs_from_trailer() {
+        let bytes: &[u8] = include_bytes!(
+            "../../hayro-tests/pdfs/custom/andler-optimal-lot-size_linearized.pdf"
+        );
+        let pdf = Pdf::new(bytes.to_vec()).expect("linearized fixture loads");
+        assert!(pdf.is_linearized());
+
+        // startxref-pinned trailer == first-page trailer for a
+        // linearised PDF per Annex F.2.
+        let startxref_trailer = pdf.trailer().expect("startxref trailer");
+        let latest = pdf.latest_trailer().expect("latest trailer");
+
+        // The first-page trailer and the main trailer cover different
+        // byte spans, so their raw dict slices must differ.
+        assert_ne!(
+            startxref_trailer.data().as_ptr(),
+            latest.data().as_ptr(),
+            "linearised file must expose distinct first-page and main trailers"
+        );
+    }
+
+    #[cfg(feature = "inspect")]
+    #[test]
+    fn latest_trailer_on_dummy_xref_is_none() {
+        use crate::xref::XRef;
+        let dummy = XRef::dummy();
+        assert!(dummy.latest_trailer().is_none());
+    }
 }
 
