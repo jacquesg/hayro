@@ -478,6 +478,65 @@ impl XRef {
         reader.read_with_context::<Dict<'_>>(&ReaderContext::new(self, false))
     }
 
+    /// Return the trailer dictionary pinned by `startxref`.
+    ///
+    /// The result is the trailer of the terminal xref section — the
+    /// section reached by starting at the file's final `startxref`
+    /// offset and walking `/Prev` links until no more remain. For a
+    /// single-section document this is the same dict as
+    /// [`XRef::trailer`]. For a document with multiple sections —
+    /// most notably a linearised document where `startxref` points at
+    /// the first-page xref and `/Prev` reaches the main xref at the
+    /// tail — this returns the dict at the end of the `/Prev` chain,
+    /// which differs from `trailer()`.
+    ///
+    /// Useful for diagnostics that compare first-page versus
+    /// tail-of-file trailer state (e.g. matching `/ID` arrays across
+    /// both sections).
+    ///
+    /// Returns `None` for dummy xrefs, for xrefs reconstructed from a
+    /// fallback root reference, or when the chain cannot be walked to
+    /// its terminus.
+    ///
+    /// # Performance
+    ///
+    /// Walks the `/Prev` chain from source bytes on each call; one
+    /// call is O(chain length). Consumers reading several fields from
+    /// the same trailer should bind the result once.
+    ///
+    /// Requires the `inspect` feature.
+    #[cfg(feature = "inspect")]
+    pub fn latest_trailer(&self) -> Option<Dict<'_>> {
+        let repr = match &self.0 {
+            Inner::Dummy => return None,
+            Inner::Some(r) => r,
+        };
+        let data = repr.data.get().as_ref();
+        let start_pos = find_last_xref_pos(data)?;
+        let mut sections: Vec<XRefSection> = Vec::new();
+        let mut visited: BTreeSet<usize> = BTreeSet::new();
+        collect_sections(data, start_pos, &mut sections, &mut visited);
+        let terminal = sections.last()?;
+        let ctx = ReaderContext::new(self, false);
+        match terminal.kind {
+            XRefKind::Table => {
+                let mut reader = Reader::new(data);
+                reader.jump(terminal.keyword_offset);
+                read_xref_table_trailer(&mut reader, &ctx)
+            }
+            XRefKind::Stream => {
+                let mut reader = Reader::new(data);
+                reader.jump(terminal.keyword_offset);
+                let stream = reader
+                    .read_with_context::<IndirectObject<Stream<'_>>>(&ctx)?
+                    .get();
+                // The stream dict is the trailer for an xref stream
+                // (§7.5.8.1). Clone to detach from the local IndirectObject.
+                Some(stream.dict().clone())
+            }
+        }
+    }
+
     /// Return all cross-reference sections, ordered most-recent-first.
     ///
     /// The sections are discovered by walking the file's `startxref`
