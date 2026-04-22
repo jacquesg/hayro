@@ -218,6 +218,36 @@ impl<'a> Stream<'a> {
         }
     }
 
+    /// Return the byte range of the raw content between the `stream`
+    /// and `endstream` keywords, independent of the dict's `/Length`.
+    ///
+    /// Useful for validators detecting `/Length` mismatches: the range
+    /// covers every byte from the position just after the `stream`
+    /// keyword's trailing EOL up to (but not including) the `e` of
+    /// `endstream`, regardless of what the stream dictionary declares
+    /// for `/Length`. Trailing whitespace inserted between the body
+    /// and `endstream` is included in the returned span.
+    ///
+    /// Returns `None` when the stream was not physically located in
+    /// the source bytes (for example, object-stream entries or
+    /// synthetic streams) or when the `endstream` keyword cannot be
+    /// found by scanning forward from the body's starting offset.
+    ///
+    /// Requires the `inspect` feature.
+    #[cfg(feature = "inspect")]
+    pub fn keyword_body_range(&self) -> Option<core::ops::Range<usize>> {
+        // body_range().start is anchored at the byte immediately
+        // following the `stream` keyword's EOL terminator by both
+        // parse_proper and parse_fallback, so it does not depend on
+        // /Length. The end is what we compute independently by
+        // scanning for the `endstream` keyword.
+        let body = self.body_range()?;
+        let pdf_data = self.dict.ctx().xref().data_bytes()?;
+        let tail = pdf_data.get(body.start..)?;
+        let rel = find_needle(tail, b"endstream")?;
+        Some(body.start..body.start + rel)
+    }
+
     /// Return the physical layout of this stream's `stream`/`endstream`
     /// keyword pair.
     ///
@@ -632,6 +662,66 @@ mod tests {
             let stream = first_stream(&pdf).expect("stream");
             let layout = stream.keyword_layout().expect("keyword layout");
             assert!(!layout.endstream_preceded_by_eol);
+        }
+
+        /// Build a PDF whose stream dictionary carries an arbitrary
+        /// `/Length` value, independent of the actual body length.
+        /// Allows exercising the `/Length`-mismatch path.
+        fn build_pdf_with_declared_length(
+            body: &[u8],
+            declared_length: usize,
+            eol: &[u8],
+            post_body: &[u8],
+        ) -> Vec<u8> {
+            let mut pdf: Vec<u8> = Vec::new();
+            pdf.extend_from_slice(b"%PDF-1.7\n");
+            let off1 = pdf.len();
+            pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+            let off2 = pdf.len();
+            pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+            let off3 = pdf.len();
+            pdf.extend_from_slice(
+                format!("3 0 obj\n<< /Length {declared_length} >>\nstream").as_bytes(),
+            );
+            pdf.extend_from_slice(eol);
+            pdf.extend_from_slice(body);
+            pdf.extend_from_slice(post_body);
+            pdf.extend_from_slice(b"endstream\nendobj\n");
+
+            let xref_pos = pdf.len();
+            pdf.extend_from_slice(b"xref\n0 4\n");
+            pdf.extend_from_slice(b"0000000000 65535 f \n");
+            pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+            pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+            pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+            pdf.extend_from_slice(b"trailer\n<< /Size 4 /Root 1 0 R >>\n");
+            pdf.extend_from_slice(format!("startxref\n{xref_pos}\n%%EOF").as_bytes());
+            pdf
+        }
+
+        #[test]
+        fn keyword_body_range_matches_body_range_when_length_is_correct() {
+            let bytes = build_pdf_with_stream(b"hello", "", b"\n", b"\n");
+            let pdf = Pdf::new(bytes).expect("pdf loads");
+            let stream = first_stream(&pdf).expect("stream");
+            let body = stream.body_range().expect("body range");
+            let kw = stream.keyword_body_range().expect("keyword body range");
+            assert_eq!(kw.start, body.start);
+            // Between-keywords span includes the body plus any trailing
+            // whitespace inserted before `endstream`.
+            assert!(kw.end >= body.end);
+        }
+
+        #[test]
+        fn keyword_body_range_ignores_declared_length() {
+            // Declared /Length is 5, but the real body is 10 bytes.
+            // The between-keywords span must reflect the PHYSICAL count.
+            let bytes = build_pdf_with_declared_length(b"0123456789", 5, b"\n", b"\n");
+            let pdf = Pdf::new(bytes).expect("pdf loads");
+            let stream = first_stream(&pdf).expect("stream");
+            let kw = stream.keyword_body_range().expect("keyword body range");
+            // 10 body bytes + trailing "\n" between body and endstream.
+            assert_eq!(kw.len(), 11);
         }
 
         #[test]
