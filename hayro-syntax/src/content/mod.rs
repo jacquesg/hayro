@@ -37,19 +37,20 @@ use crate::content::ops::TypedInstruction;
 use crate::object;
 use crate::object::dict::InlineImageDict;
 use crate::object::name::{Name, skip_name_like};
-use crate::object::{Array, Null, Number, Object, Stream};
+use crate::object::{Array, Number, Object, Stream};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 use crate::trivia::is_white_space_character;
 use crate::util::find_needle;
-use core::array;
 use core::fmt::{Debug, Formatter};
 use core::ops::Deref;
 use smallvec::SmallVec;
 
 // 6 operands are used for example for ctm or cubic curves,
 // but anything above should be pretty rare (only for example for
-// DeviceN color spaces, or invalid PDF files). So we settle on 10.
+// DeviceN colour spaces, or invalid PDF files). So we settle on 10
+// as the inline cap; PDF/A-2 allows DeviceN with up to 32 components
+// (ISO 32000-1 §8.6.6.5), which spill onto the heap.
 const OPERANDS_THRESHOLD: usize = 10;
 
 impl Debug for Operator<'_> {
@@ -458,10 +459,10 @@ impl<'b, 'a> Instruction<'b, 'a> {
 
 /// A stack holding the arguments of an operator.
 pub struct Stack<'a> {
-    // TODO: Explore using an object pool to avoid repeatedly
-    // allocating/deallocating objects.
-    data: [Object<'a>; OPERANDS_THRESHOLD],
-    len: usize,
+    // The inline cap of `OPERANDS_THRESHOLD` covers the typical case
+    // (most ops use ≤6 operands), while DeviceN colour spaces with more
+    // than 10 components spill onto the heap rather than truncating.
+    data: SmallVec<[Object<'a>; OPERANDS_THRESHOLD]>,
 }
 
 impl<'a> Default for Stack<'a> {
@@ -474,31 +475,25 @@ impl<'a> Stack<'a> {
     /// Create a new, empty stack.
     pub fn new() -> Self {
         Self {
-            data: array::from_fn(|_| Object::Null(Null)),
-            len: 0,
+            data: SmallVec::new(),
         }
     }
 
     fn push(&mut self, operand: Object<'a>) -> Option<()> {
-        if self.len >= OPERANDS_THRESHOLD {
-            return None;
-        }
-
-        self.data[self.len] = operand;
-        self.len += 1;
+        self.data.push(operand);
         Some(())
     }
 
     fn clear(&mut self) {
-        self.len = 0;
+        self.data.clear();
     }
 
     fn len(&self) -> usize {
-        self.len
+        self.data.len()
     }
 
     fn as_slice(&self) -> &[Object<'a>] {
-        &self.data[..self.len]
+        self.data.as_slice()
     }
 
     fn get<'b, T>(&'b self, index: usize) -> Option<T>
@@ -866,5 +861,58 @@ mod tests {
             body_bytes.len() == 4 || (body_bytes.len() == 5 && body_bytes[4].is_ascii_whitespace()),
             "body has expected length, got {body_bytes:?}"
         );
+    }
+
+    // --- DeviceN beyond the inline operand cap ---------------------------
+
+    #[test]
+    fn device_n_twelve_operand_scn() {
+        // PDF/A-2 permits DeviceN colour spaces with up to 32 components
+        // (ISO 32000-1 §8.6.6.5). With the legacy fixed-size 10-slot stack
+        // a 12-tint `scn` truncated silently AND `next()` returned `None`
+        // mid-stream, halting all subsequent content parsing. Verify that
+        // the SmallVec-backed stack now dispatches the full operand list
+        // and continues to parse the trailing op.
+        use crate::content::ops::{NonStrokeColorNamed, TypedInstruction};
+
+        // Use only exactly representable f32 fractions so the parsed
+        // f64 round-trips through `as_f64()` cleanly.
+        let content: &[u8] =
+            b"/CS0 cs 0.5 0.25 0.125 0.0625 0.03125 0.015625 0.5 0.25 0.125 0.0625 0.5 0.25 \
+              /Pat0 scn 100 200 m";
+
+        let expected: [f64; 12] = [
+            0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625, 0.5, 0.25, 0.125, 0.0625, 0.5, 0.25,
+        ];
+
+        let mut iter = TypedIter::new(content);
+
+        // First op: `cs` selecting the DeviceN colour space.
+        assert!(matches!(
+            iter.next(),
+            Some(TypedInstruction::ColorSpaceNonStroke(_))
+        ));
+
+        // Second op: `scn` with 12 tints + a /Pat0 name.
+        match iter.next() {
+            Some(TypedInstruction::NonStrokeColorNamed(NonStrokeColorNamed(nums, Some(name)))) => {
+                assert_eq!(
+                    nums.len(),
+                    12,
+                    "expected all 12 tint operands, got {}",
+                    nums.len()
+                );
+                for (idx, want) in expected.iter().enumerate() {
+                    assert_eq!(nums[idx].as_f64(), *want, "tint {idx} mismatch");
+                }
+                assert_eq!(name.as_ref(), b"Pat0");
+            }
+            other => panic!("expected NonStrokeColorNamed with 12 tints, got {other:?}"),
+        }
+
+        // Third op: trailing `m` must still parse — proves the iterator
+        // did not give up after the over-capacity push.
+        assert!(matches!(iter.next(), Some(TypedInstruction::MoveTo(_))));
+        assert!(iter.next().is_none());
     }
 }
