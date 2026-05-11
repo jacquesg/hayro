@@ -1169,12 +1169,6 @@ fn populate_from_xref_table<'a>(
         populate_xref_impl_inner(data, prev as usize, insert_map, visited)?;
     }
 
-    // In hybrid files, entries in `XRefStm` should have higher priority, therefore we insert them
-    // after looking at `PREV`.
-    if let Some(xref_stm) = trailer.get::<i32>(XREF_STM) {
-        populate_xref_impl_inner(data, xref_stm as usize, insert_map, visited)?;
-    }
-
     while let Some(header) = reader.read_without_context::<SubsectionHeader>() {
         reader.skip_white_spaces();
 
@@ -1209,6 +1203,23 @@ fn populate_from_xref_table<'a>(
                 );
             }
         }
+    }
+
+    // In hybrid files, entries in `XRefStm` must override the classic xref
+    // table entries for the same revision (PDF 32000-1 § 7.5.8.4): the classic
+    // table is a legacy-reader fallback that pre-dates cross-reference
+    // streams, and the spec instructs PDF 1.5+ readers to prefer the stream's
+    // entries. Insert after `PREV` (older revisions) AND after the current
+    // classic table so the stream's entries win for this revision.
+    if let Some(xref_stm) = trailer.get::<i32>(XREF_STM) {
+        // Hybrid files often share a single `/XRefStm` across multiple
+        // revision trailers (each later revision's incremental update
+        // re-publishes the same `/XRefStm` pointer rather than authoring
+        // a new stream). The first traversal inserts the stream's entries
+        // into the visited set; subsequent visits MUST skip silently rather
+        // than propagate the cycle-guard's `None` upward, which would abort
+        // the whole xref build and force a fallback scan.
+        let _ = populate_xref_impl_inner(data, xref_stm as usize, insert_map, visited);
     }
 
     Some(trailer.data())
@@ -2226,5 +2237,167 @@ mod tests {
         let data = b"xref\n0 999999999999999999999\ntrailer\n<<>>";
         let mut reader = Reader::new(data);
         assert!(read_xref_table_trailer(&mut reader, &ReaderContext::dummy()).is_none());
+    }
+
+    /// A shared `/XRefStm` referenced by multiple revision trailers must not
+    /// abort the xref build via the cycle guard. Real-world incremental
+    /// updates routinely re-publish the original revision's `/XRefStm`
+    /// pointer in the new trailer (e.g. signing tools that update `/Prev`
+    /// + `/XRefStm` in lockstep). The first traversal visits the stream
+    /// offset; subsequent visits return `None` from `populate_xref_impl_inner`,
+    /// and that `None` must be ignored — propagating it would force the
+    /// whole `root_xref` call to fail and fall back to a heuristic scan
+    /// that loses the latest revision's overrides.
+    #[test]
+    fn shared_xref_stm_across_revisions_loads_latest_classic_override() {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.7\n");
+
+        // --- Revision 1: original catalog + a shared XRefStm. ---
+        let original_offset = pdf.len();
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Marker /Original >>\nendobj\n",
+        );
+
+        let obj2_offset = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+
+        // The shared XRefStm — re-asserts obj 1 at its rev-1 offset. Rev 2's
+        // trailer will reference this same offset.
+        let xref_stm_offset = pdf.len();
+        let mut stream_data: Vec<u8> = Vec::with_capacity(6);
+        stream_data.push(0x01);
+        stream_data.extend_from_slice(&(original_offset as u32).to_be_bytes());
+        stream_data.push(0x00);
+        let stream_len = stream_data.len();
+        pdf.extend_from_slice(
+            format!(
+                "3 0 obj\n<< /Type /XRef /Size 4 /W [ 1 4 1 ] /Index [ 1 1 ] \
+                 /Length {stream_len} /Root 1 0 R >>\nstream\n"
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(&stream_data);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let xref_a_offset = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 4\n");
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{original_offset:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{obj2_offset:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{xref_stm_offset:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 4 /Root 1 0 R /XRefStm {xref_stm_offset} >>\n\
+                 startxref\n{xref_a_offset}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+
+        // --- Revision 2: incremental update with a new catalog body. ---
+        let updated_offset = pdf.len();
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Marker /Updated >>\nendobj\n",
+        );
+
+        let xref_b_offset = pdf.len();
+        pdf.extend_from_slice(b"xref\n1 1\n");
+        pdf.extend_from_slice(format!("{updated_offset:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 4 /Root 1 0 R /Prev {xref_a_offset} \
+                 /XRefStm {xref_stm_offset} >>\n\
+                 startxref\n{xref_b_offset}\n%%EOF"
+            )
+            .as_bytes(),
+        );
+
+        let pdf_doc = Pdf::new(pdf).expect("two-revision hybrid loads");
+        let entry = pdf_doc
+            .xref()
+            .entry(ObjectIdentifier::new(1, 0))
+            .expect("object 1 has an xref entry");
+        match entry {
+            EntryType::Normal { offset } => assert_eq!(
+                offset, updated_offset,
+                "rev 2's classic xref override must win over rev 1's classic + the shared XRefStm \
+                 (got offset {offset}, expected {updated_offset})"
+            ),
+            other => panic!("expected Normal entry, got {other:?}"),
+        }
+    }
+
+    /// In a hybrid file the classic xref table is the legacy-reader fallback
+    /// and the `/XRefStm` is authoritative for PDF 1.5+ readers
+    /// (PDF 32000-1 § 7.5.8.4). When both reference the same object number,
+    /// the stream's entry must win.
+    #[test]
+    fn hybrid_xref_stm_overrides_classic_entries() {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.7\n");
+
+        // Object 1, "legacy" body, referenced by the classic xref table.
+        let legacy_offset = pdf.len();
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /TestMarker /Legacy >>\nendobj\n",
+        );
+
+        let obj2_offset = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+
+        // Object 1, "new" body, referenced by the XRefStm.
+        let new_offset = pdf.len();
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /TestMarker /New >>\nendobj\n",
+        );
+
+        // Object 4 — the XRefStm — overrides only object 1.
+        let xref_stm_offset = pdf.len();
+        let mut stream_data: Vec<u8> = Vec::with_capacity(6);
+        stream_data.push(0x01); // in-use
+        stream_data.extend_from_slice(&(new_offset as u32).to_be_bytes());
+        stream_data.push(0x00); // generation
+        let stream_len = stream_data.len();
+        pdf.extend_from_slice(
+            format!(
+                "4 0 obj\n<< /Type /XRef /Size 5 /W [ 1 4 1 ] /Index [ 1 1 ] \
+                 /Length {stream_len} /Root 1 0 R >>\nstream\n"
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(&stream_data);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        // Classic xref table — points object 1 at the LEGACY body, which is
+        // the entry the spec expects pre-1.5 readers to follow.
+        let xref_offset = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 5\n");
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{legacy_offset:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{obj2_offset:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(b"0000000000 00001 f \n");
+        pdf.extend_from_slice(format!("{xref_stm_offset:010} 00000 n \n").as_bytes());
+
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 5 /Root 1 0 R /XRefStm {xref_stm_offset} >>\n\
+                 startxref\n{xref_offset}\n%%EOF"
+            )
+            .as_bytes(),
+        );
+
+        let pdf_doc = Pdf::new(pdf).expect("hybrid pdf loads");
+        let entry = pdf_doc
+            .xref()
+            .entry(ObjectIdentifier::new(1, 0))
+            .expect("object 1 has an xref entry");
+        match entry {
+            EntryType::Normal { offset } => assert_eq!(
+                offset, new_offset,
+                "XRefStm entry must override classic xref for the same revision \
+                 (got offset {offset}, expected {new_offset})"
+            ),
+            other => panic!("expected Normal entry, got {other:?}"),
+        }
     }
 }
