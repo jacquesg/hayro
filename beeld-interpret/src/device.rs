@@ -49,6 +49,18 @@ pub trait Device<'a> {
     fn begin_marked_content(&mut self, _tag: &[u8], _mcid: Option<i32>) {}
     /// Called at the end of a marked content sequence (EMC).
     fn end_marked_content(&mut self) {}
+    /// Called immediately before the glyphs of a single text-showing operator
+    /// (`Tj`, `TJ`, `'`, `"`) are drawn, and again after the last of them.
+    ///
+    /// One operator corresponds to one PDF text object; a recording device can
+    /// bracket on these to group glyphs into runs that mirror the content
+    /// stream's own text-show operators — the same segmentation a viewer's text
+    /// layer exposes — instead of inferring run boundaries from glyph geometry.
+    /// Rendering devices ignore them. Default: no-op.
+    fn begin_glyph_run(&mut self) {}
+    /// Called after the last glyph of a text-showing operator. See
+    /// [`begin_glyph_run`](Device::begin_glyph_run).
+    fn end_glyph_run(&mut self) {}
 }
 
 /// A device that discards all drawing operations.

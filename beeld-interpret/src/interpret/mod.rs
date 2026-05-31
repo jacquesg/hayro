@@ -583,7 +583,9 @@ pub fn interpret<'a>(
                     .map(TextStateFont::Fallback);
                 }
 
+                device.begin_glyph_run();
                 text::show_text_string(context, device, resources, s.0);
+                device.end_glyph_run();
             }
             TypedInstruction::ShowTexts(s) => {
                 if context.get().text_state.font.is_none() {
@@ -596,6 +598,7 @@ pub fn interpret<'a>(
                     .map(TextStateFont::Fallback);
                 }
 
+                device.begin_glyph_run();
                 for obj in s.0.iter::<Object<'_>>() {
                     match obj {
                         Object::Number(num) => {
@@ -607,6 +610,7 @@ pub fn interpret<'a>(
                         _ => {}
                     }
                 }
+                device.end_glyph_run();
             }
             TypedInstruction::HorizontalScaling(h) => {
                 context.get_mut().text_state.horizontal_scaling = h.0.as_f32();
@@ -629,7 +633,9 @@ pub fn interpret<'a>(
             }
             TypedInstruction::NextLineAndShowText(n) => {
                 text::next_line(context, 0.0, -context.get().text_state.leading as f64);
+                device.begin_glyph_run();
                 text::show_text_string(context, device, resources, n.0);
+                device.end_glyph_run();
             }
             TypedInstruction::TextRenderingMode(r) => {
                 let mode = match r.0.as_i64() {
@@ -733,7 +739,9 @@ pub fn interpret<'a>(
                 context.get_mut().text_state.word_space = t.0.as_f32();
                 context.get_mut().text_state.char_space = t.1.as_f32();
                 text::next_line(context, 0.0, -context.get().text_state.leading as f64);
+                device.begin_glyph_run();
                 text::show_text_string(context, device, resources, t.2);
+                device.end_glyph_run();
             }
             _ => {
                 warn!("failed to read an operator");
