@@ -17,8 +17,8 @@ use crate::x_object::{
 };
 use beeld_syntax::content::TypedIter;
 use beeld_syntax::content::ops::TypedInstruction;
-use beeld_syntax::object::dict::keys::{ANNOTS, AP, F, MCID, N, OC, RECT};
-use beeld_syntax::object::{Array, Dict, Name, Object, Rect, Stream, dict_or_stream};
+use beeld_syntax::object::dict::keys::{ACTUAL_TEXT, ANNOTS, AP, F, MCID, N, OC, RECT};
+use beeld_syntax::object::{Array, Dict, Name, Object, Rect, Stream, String, dict_or_stream};
 use beeld_syntax::page::{Page, Resources};
 use kurbo::{Affine, Point, Shape};
 use rustc_hash::FxHashMap;
@@ -479,6 +479,8 @@ pub fn interpret<'a>(
                 // 2. An inline dictionary with an OC key
 
                 let mcid = dict_or_stream(bdc.1).and_then(|(props, _)| props.get::<i32>(MCID));
+                let actual_text = dict_or_stream(bdc.1)
+                    .and_then(|(props, _)| props.get::<String<'_>>(ACTUAL_TEXT));
 
                 let oc = bdc
                     .1
@@ -505,7 +507,11 @@ pub fn interpret<'a>(
                     context.ocg_state.begin_marked_content();
                 }
 
-                device.begin_marked_content(bdc.0, mcid);
+                device.begin_marked_content(
+                    bdc.0,
+                    mcid,
+                    actual_text.as_ref().map(|text| text.as_bytes()),
+                );
             }
             TypedInstruction::MarkedContentPointWithProperties(_) => {}
             TypedInstruction::EndMarkedContent(_) => {
@@ -515,7 +521,7 @@ pub fn interpret<'a>(
             TypedInstruction::MarkedContentPoint(_) => {}
             TypedInstruction::BeginMarkedContent(bmc) => {
                 context.ocg_state.begin_marked_content();
-                device.begin_marked_content(bmc.0, None);
+                device.begin_marked_content(bmc.0, None, None);
             }
             TypedInstruction::BeginText(_) => {
                 context.get_mut().text_state.text_matrix = Affine::IDENTITY;
