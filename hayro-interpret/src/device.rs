@@ -56,9 +56,19 @@ pub trait Device<'a> {
     }
     /// Called at the beginning of a marked content sequence (BMC/BDC).
     ///
-    /// The tag is the marked content tag (e.g. b"P", b"Span"). The mcid is
-    /// the marked content identifier from the properties dict, if present.
-    fn begin_marked_content(&mut self, _tag: &[u8], _mcid: Option<i32>) {}
+    /// The tag is the marked content tag (e.g. b"P", b"Span"). The mcid is the
+    /// marked content identifier from the properties dict, if present.
+    /// `actual_text` carries the raw `/ActualText` string bytes (PDF text-string
+    /// encoding — UTF-16BE or PDFDocEncoded) from the properties dict, if present;
+    /// a recording device can use it as the text for glyphs that lack a ToUnicode
+    /// mapping (e.g. colour-emoji glyphs).
+    fn begin_marked_content(
+        &mut self,
+        _tag: &[u8],
+        _mcid: Option<i32>,
+        _actual_text: Option<&[u8]>,
+    ) {
+    }
     /// Called at the end of a marked content sequence (EMC).
     fn end_marked_content(&mut self) {}
     /// Called immediately before the glyphs of a single text-showing operator
