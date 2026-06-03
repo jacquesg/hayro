@@ -9,20 +9,51 @@ use crate::trivia::is_regular_character;
 use core::borrow::Borrow;
 use core::fmt::{self, Debug, Formatter};
 use core::hash::{Hash, Hasher};
-use core::ops::Deref;
+use core::num::NonZeroU32;
+use core::ops::{Deref, Range};
 use smallvec::SmallVec;
+
+/// Source offset in the parent PDF byte stream where the name token
+/// BODY (the bytes after the leading `/`) starts. Stored as
+/// `Option<NonZeroU32>` so the niche optimisation packs the
+/// representation to 4 bytes — keeping `size_of::<Object<'_>>()` from
+/// drifting when [`Name`] is embedded in the `Object` enum.
+///
+/// `None` for:
+///   * names constructed via [`Name::new`] / [`Name::new_unescaped`] /
+///     [`Name::new_escaped`] from a free-standing byte slice — the
+///     caller did not give us a parent-buffer offset to record.
+///   * synthetic names (no source span at all).
+///   * names whose body starts at an offset ≥ `u32::MAX` (i.e. PDFs
+///     ≥ 4 GiB) — see [`Name::new_at`]. Hayro is permissive here:
+///     `byte_range()` simply reports `None` rather than truncating
+///     silently. Callers that absolutely need to byte-rewrite such
+///     names in 4 GiB+ inputs must fall back to a string-search pass.
+///
+/// `Some(off)` only for names produced by the parser
+/// (the `Readable<'a> for Name<'a>` impl), where `off` is the absolute
+/// offset in the buffer originally passed to the `Reader`. The body
+/// start is always ≥ 1 (the leading `/` lives at offset 0 at the
+/// earliest), so the niche-`0` discriminant of `NonZeroU32` is
+/// available for the `None` case without losing any representable
+/// offset.
+type SourceOffset = Option<NonZeroU32>;
 
 #[derive(Clone)]
 enum NameInner<'a> {
     /// A name whose PDF source contains no `#` escapes. `source` IS the
     /// logical (decoded) byte sequence.
-    Borrowed { source: &'a [u8] },
+    Borrowed {
+        source: &'a [u8],
+        offset: SourceOffset,
+    },
     /// A name whose PDF source contains one or more `#XX` escape
     /// sequences. `source` is the pre-decode bytes; `decoded` is the
     /// escape-expanded byte sequence.
     Escaped {
         source: &'a [u8],
         decoded: SmallVec<[u8; 23]>,
+        offset: SourceOffset,
     },
     /// A name constructed programmatically, without a PDF source span.
     /// [`Name::source`] returns an empty slice in this case.
@@ -44,7 +75,7 @@ impl<'a> Deref for Name<'a> {
 impl AsRef<[u8]> for Name<'_> {
     fn as_ref(&self) -> &[u8] {
         match &self.0 {
-            NameInner::Borrowed { source } => source,
+            NameInner::Borrowed { source, .. } => source,
             NameInner::Escaped { decoded, .. } => decoded,
             NameInner::Synthetic { decoded } => decoded,
         }
@@ -97,7 +128,10 @@ impl<'a> Name<'a> {
     /// Create a new name from an unescaped byte sequence.
     #[inline]
     pub fn new_unescaped(data: &'a [u8]) -> Self {
-        Self(NameInner::Borrowed { source: data })
+        Self(NameInner::Borrowed {
+            source: data,
+            offset: None,
+        })
     }
 
     /// Create a new name from bytes that may contain escape sequences.
@@ -107,6 +141,35 @@ impl<'a> Name<'a> {
     /// source span and decodes `#XX` sequences for the logical value.
     #[inline]
     pub fn new_escaped(data: &'a [u8]) -> Option<Self> {
+        Self::new_escaped_at(data, None)
+    }
+
+    /// Internal — same as [`Name::new`] but records the absolute source
+    /// offset in the parent buffer. Used by the [`Readable`] impl so
+    /// [`Name::byte_range`] returns an absolute span.
+    ///
+    /// `offset` is the absolute byte offset of the name token BODY
+    /// (the position immediately after the leading `/`). Because the
+    /// solidus occupies at least one byte at the start of the token,
+    /// `offset` is always ≥ 1 for well-formed parse output; the
+    /// `NonZeroU32::new(...)` conversion below therefore only returns
+    /// `None` when `offset` does not fit in a `u32`, in which case
+    /// the resulting [`Name`] carries no [`Name::byte_range`].
+    #[inline]
+    fn new_at(data: &'a [u8], offset: usize) -> Option<Self> {
+        let packed = u32::try_from(offset).ok().and_then(NonZeroU32::new);
+        if !data.contains(&b'#') {
+            Some(Self(NameInner::Borrowed {
+                source: data,
+                offset: packed,
+            }))
+        } else {
+            Self::new_escaped_at(data, packed)
+        }
+    }
+
+    #[inline]
+    fn new_escaped_at(data: &'a [u8], offset: SourceOffset) -> Option<Self> {
         let mut result = SmallVec::new();
         let mut r = Reader::new(data);
 
@@ -122,6 +185,7 @@ impl<'a> Name<'a> {
         Some(Self(NameInner::Escaped {
             source: data,
             decoded: result,
+            offset,
         }))
     }
 
@@ -142,10 +206,54 @@ impl<'a> Name<'a> {
     /// `Name` produced via the parse path has a non-empty source.
     pub fn source(&self) -> &'a [u8] {
         match &self.0 {
-            NameInner::Borrowed { source } => source,
+            NameInner::Borrowed { source, .. } => source,
             NameInner::Escaped { source, .. } => source,
             NameInner::Synthetic { .. } => &[],
         }
+    }
+
+    /// Alias for [`Name::source`] — the pre-decode raw bytes of the
+    /// name token (no leading `/`, `#XX` escapes preserved). Provided
+    /// for symmetry with [`Name::byte_range`]: `raw_bytes()` and
+    /// `byte_range()` together describe the exact slice of the parent
+    /// PDF buffer this `Name` was parsed from, which downstream
+    /// remediation passes need to do multi-site byte-identical
+    /// rewrites of mis-encoded names.
+    #[inline]
+    pub fn raw_bytes(&self) -> &'a [u8] {
+        self.source()
+    }
+
+    /// Absolute byte range of this name token's BODY in the parent PDF
+    /// buffer, EXCLUDING the leading `/`. Indices are usable directly
+    /// against the slice originally handed to the [`Reader`] /
+    /// `Pdf::new` pipeline.
+    ///
+    /// Returns `None` for:
+    ///   * names produced via [`Name::new`] / [`Name::new_unescaped`] /
+    ///     [`Name::new_escaped`] (no parent-buffer reference is
+    ///     available to the constructor).
+    ///   * synthetic names (no source span at all).
+    ///
+    /// For names parsed from a [`Reader`] this is always `Some(range)`
+    /// with `range.end - range.start == self.source().len()`.
+    pub fn byte_range(&self) -> Option<Range<usize>> {
+        let (source, offset) = match &self.0 {
+            NameInner::Borrowed {
+                source,
+                offset: Some(off),
+            } => (source, off),
+            NameInner::Escaped {
+                source,
+                offset: Some(off),
+                ..
+            } => (source, off),
+            NameInner::Borrowed { offset: None, .. }
+            | NameInner::Escaped { offset: None, .. }
+            | NameInner::Synthetic { .. } => return None,
+        };
+        let start = offset.get() as usize;
+        Some(start..start + source.len())
     }
 
     /// Construct a [`Name`] from owned decoded bytes, with no PDF source
@@ -183,8 +291,12 @@ impl<'a> Readable<'a> for Name<'a> {
         let end = r.offset();
 
         // Exclude leading solidus.
-        let data = r.range(start + 1..end)?;
-        Self::new(data)
+        let body_start = start + 1;
+        let data = r.range(body_start..end)?;
+        // Record `body_start` so `Name::byte_range` can report the
+        // absolute span of the token body (post-`/`) in the parent
+        // buffer that the `Reader` was constructed over.
+        Self::new_at(data, body_start)
     }
 }
 
@@ -417,5 +529,121 @@ mod tests {
         // Source must only cover the name token, not trailing bytes.
         let name = parse(b"/Hi there");
         assert_eq!(name.source(), b"Hi");
+    }
+
+    // --- Phase A (Wave R-UTF8-NameToken-Substrate): byte_range / raw_bytes ---
+    //
+    // These accessors expose the absolute span of the name token BODY
+    // (post-`/`) in the parent buffer plus an alias for the pre-decode
+    // source bytes. Phase B (bridge) and Phase C (codegen +
+    // dispatcher) consume these to multi-site-rewrite non-UTF-8 name
+    // tokens during PDF/A remediation. See the wave commit body for
+    // the cohort and the upstream-cherry-pick plan.
+
+    #[test]
+    fn byte_range_at_buffer_start_excludes_leading_solidus() {
+        // `/Hello` → body at [1, 6). 5-byte body matches "Hello".
+        let bytes: &[u8] = b"/Hello";
+        let name = parse(bytes);
+        let range = name.byte_range().expect("parsed name carries byte_range");
+        assert_eq!(range, 1..6);
+        assert_eq!(&bytes[range.clone()], b"Hello");
+        assert_eq!(range.end - range.start, name.source().len());
+    }
+
+    #[test]
+    fn byte_range_after_offset_in_parent_buffer() {
+        // Place a name several bytes into the buffer; byte_range must
+        // be absolute to the buffer the Reader was constructed over.
+        let bytes: &[u8] = b"<<\n/Key /Val>>";
+        let mut r = Reader::new(bytes);
+        // Skip `<<\n` so the reader sits at offset 3 (`/Key`).
+        r.read_bytes(3).unwrap();
+        let name = r.read_without_context::<Name<'_>>().unwrap();
+        let range = name.byte_range().unwrap();
+        // `/Key` starts at offset 3; body starts at offset 4.
+        assert_eq!(range, 4..7);
+        assert_eq!(&bytes[range], b"Key");
+    }
+
+    #[test]
+    fn byte_range_for_escaped_name_covers_pre_decode_bytes() {
+        // `#20` is 3 bytes pre-decode, 1 byte post-decode. byte_range
+        // tracks the pre-decode span so callers can splice the
+        // original token verbatim.
+        let bytes: &[u8] = b"/lime#20Green";
+        let name = parse(bytes);
+        let range = name.byte_range().unwrap();
+        assert_eq!(range, 1..13);
+        assert_eq!(&bytes[range.clone()], b"lime#20Green");
+        assert_eq!(range.end - range.start, name.source().len());
+        // Post-decode value differs in length.
+        assert_eq!(name.as_ref(), b"lime Green");
+    }
+
+    #[test]
+    fn byte_range_for_empty_solidus_only_name() {
+        // A bare `/` is a zero-length name; byte_range is an empty span
+        // immediately past the solidus.
+        let bytes: &[u8] = b"/";
+        let name = parse(bytes);
+        let range = name.byte_range().unwrap();
+        assert_eq!(range, 1..1);
+        assert!(name.source().is_empty());
+    }
+
+    #[test]
+    fn byte_range_none_for_new_unescaped() {
+        // Direct construction from a free-standing slice does NOT
+        // carry a parent-buffer offset.
+        let name = Name::new_unescaped(b"Hi");
+        assert!(name.byte_range().is_none());
+        assert_eq!(name.raw_bytes(), b"Hi");
+    }
+
+    #[test]
+    fn byte_range_none_for_new_escaped() {
+        let name = Name::new_escaped(b"lime#20Green").unwrap();
+        assert!(name.byte_range().is_none());
+        assert_eq!(name.raw_bytes(), b"lime#20Green");
+        assert_eq!(name.as_ref(), b"lime Green");
+    }
+
+    #[test]
+    fn byte_range_none_for_synthetic() {
+        let name = Name::from_synthetic(b"Synthetic");
+        assert!(name.byte_range().is_none());
+        assert_eq!(name.raw_bytes(), b"");
+    }
+
+    #[test]
+    fn raw_bytes_matches_source_for_parsed_name() {
+        // raw_bytes() is an alias for source(); the two must always
+        // return the same slice for parsed names.
+        let name = parse(b"/AB#42cd");
+        assert_eq!(name.raw_bytes(), name.source());
+        assert_eq!(name.raw_bytes(), b"AB#42cd");
+        assert_eq!(name.as_ref(), b"ABBcd");
+    }
+
+    #[test]
+    fn byte_range_consistent_with_raw_bytes_length() {
+        // Invariant: range.end - range.start == raw_bytes().len() for
+        // every parsed name. Spot-check a few token shapes.
+        for src in [
+            &b"/Hi"[..],
+            &b"/Hi#20there"[..],
+            &b"/A;Name_With-Various***Characters?"[..],
+            &b"/.notdef"[..],
+        ] {
+            let name = parse(src);
+            let range = name.byte_range().unwrap();
+            assert_eq!(
+                range.end - range.start,
+                name.raw_bytes().len(),
+                "byte_range / raw_bytes mismatch for {src:?}"
+            );
+            assert_eq!(&src[range], name.raw_bytes());
+        }
     }
 }

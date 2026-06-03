@@ -20,6 +20,26 @@ use crate::object::dict::keys::*;
 use crate::object::stream::{DecodeFailure, FilterResult, ImageDecodeParams};
 use core::ops::Deref;
 
+/// Maximum number of bytes any single stream filter may decode to.
+///
+/// A defensive ceiling against decompression bombs — a small compressed
+/// payload (a few KiB) that expands to gigabytes via back-reference
+/// loops or run-length expansion. Enforced *inside* each decoder's
+/// output-growth loop (see [`lzw_flate`] and [`run_length`]), because a
+/// post-hoc length check is too late: the oversized `Vec` is already
+/// allocated by the time the filter returns. 128 MiB sits an order of
+/// magnitude above the 32 MiB per-indirect-object scan bound used
+/// elsewhere in the toolkit, so legitimate large embedded streams pass
+/// while `1 KiB -> GiB` bombs are rejected. V1-FUZZ-001.
+pub(crate) const MAX_DECOMPRESSED_BYTES: usize = 128 * 1024 * 1024;
+
+/// Maximum number of chained filters on a single stream
+/// (`/Filter [/FlateDecode /FlateDecode ...]`). Each stage is
+/// independently bounded by [`MAX_DECOMPRESSED_BYTES`], so peak memory
+/// is bounded regardless; this caps the CPU cost of an absurdly long
+/// chain that re-expands at every stage. V1-FUZZ-001.
+pub(crate) const MAX_FILTER_CHAIN: usize = 16;
+
 /// A data filter.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Filter {

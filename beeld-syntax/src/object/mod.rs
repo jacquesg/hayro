@@ -385,10 +385,19 @@ mod tests {
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn object_sizes() {
-        assert_eq!(size_of::<Object<'_>>(), 56);
+        // `Name` carries an extra `Option<NonZeroU32>` source-offset
+        // word so `Name::byte_range` can report the absolute span of
+        // the token body in the parent buffer (Phase A of Wave
+        // R-UTF8-NameToken-Substrate). The niche packing keeps the
+        // payload at 4 bytes; alignment then pushes the variant from
+        // 48 → 56 bytes (and `Object<'_>` from 56 → 64). The
+        // assertions are budget guards, not invariants — bumping them
+        // is the deliberate trade-off for enabling byte-identical
+        // multi-site name rewrites during remediation.
+        assert_eq!(size_of::<Object<'_>>(), 64);
         assert_eq!(size_of::<Array<'_>>(), 32);
         assert_eq!(size_of::<Dict<'_>>(), 8);
-        assert_eq!(size_of::<Name<'_>>(), 48);
+        assert_eq!(size_of::<Name<'_>>(), 56);
         assert_eq!(size_of::<Null>(), 0);
         assert_eq!(size_of::<Number>(), 16);
         assert_eq!(size_of::<Stream<'_>>(), 24);
