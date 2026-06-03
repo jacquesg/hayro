@@ -102,9 +102,14 @@ impl<'a> BitReader<'a> {
     }
 
     /// Get the tail (aligned to the current byte position) of the data.
+    ///
+    /// Returns an empty slice if the bit cursor has advanced past the
+    /// end of the buffer, rather than panicking on an out-of-bounds
+    /// slice — `byte_pos()` is derived from a bit position that hostile
+    /// input can drive past `data.len()`. V1-FUZZ-001.
     #[inline]
     pub fn tail(&self) -> &'a [u8] {
-        &self.data[self.byte_pos()..]
+        self.data.get(self.byte_pos()..).unwrap_or(&[])
     }
 
     /// Get the full byte (aligned to the byte boundary) of the current position.

@@ -7,6 +7,14 @@ pub(crate) fn decode(data: &[u8]) -> Option<Vec<u8>> {
     let mut decoded = vec![];
 
     loop {
+        if decoded.len() > crate::filter::MAX_DECOMPRESSED_BYTES {
+            warn!(
+                "run-length stream exceeds maximum decompressed size of {} bytes",
+                crate::filter::MAX_DECOMPRESSED_BYTES
+            );
+            return None;
+        }
+
         let length = reader.read_byte()?;
 
         match length {

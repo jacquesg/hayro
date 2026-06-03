@@ -2,6 +2,14 @@ use crate::object::{ObjectIdentifier, ObjectLike};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 
+/// Maximum indirect-object reference nesting depth before parsing
+/// aborts. Mirrors the xref-chain ceiling (`MAX_XREF_CHAIN_DEPTH = 256`
+/// in `xref.rs`): a deep but acyclic chain of indirect references
+/// (`1 0 R` -> `2 0 R` -> ...) would otherwise recurse to a native
+/// stack overflow, which the parent-chain cycle check does not bound.
+/// V1-FUZZ-001.
+const MAX_INDIRECT_OBJECT_DEPTH: usize = 256;
+
 #[derive(Debug, Clone)]
 pub(crate) struct IndirectObject<T> {
     id: ObjectIdentifier,
@@ -28,6 +36,12 @@ where
 
         if ctx.parent_chain_contains(&id) {
             warn!("cycle detected in indirect object: {id:?}");
+
+            return None;
+        }
+
+        if ctx.parent_chain_len() >= MAX_INDIRECT_OBJECT_DEPTH {
+            warn!("indirect object nesting exceeds maximum depth of {MAX_INDIRECT_OBJECT_DEPTH}");
 
             return None;
         }

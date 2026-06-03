@@ -329,6 +329,16 @@ impl<'a> Stream<'a> {
         let data = self.raw_data();
         let filters_and_params = self.filters_and_params();
 
+        if filters_and_params.filters.len() > crate::filter::MAX_FILTER_CHAIN {
+            warn!(
+                "stream filter chain length {} exceeds maximum of {}",
+                filters_and_params.filters.len(),
+                crate::filter::MAX_FILTER_CHAIN
+            );
+
+            return Err(DecodeFailure::StreamDecode);
+        }
+
         let mut current: Option<FilterResult<'a>> = None;
 
         for (filter, params) in filters_and_params

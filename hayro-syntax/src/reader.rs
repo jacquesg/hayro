@@ -238,6 +238,19 @@ impl<'a> ReaderContext<'a> {
             ReaderContextInner::Dummy { .. } => {}
         }
     }
+
+    /// Current indirect-object nesting depth (length of the parent
+    /// chain). Used to bound reference recursion — a deep but acyclic
+    /// chain of indirect references would otherwise recurse to a native
+    /// stack overflow, which cycle detection alone does not catch.
+    /// V1-FUZZ-001.
+    #[inline]
+    pub(crate) fn parent_chain_len(&self) -> usize {
+        match &self.0 {
+            ReaderContextInner::Shared(inner) => inner.parent_chain.len(),
+            ReaderContextInner::Dummy { .. } => 0,
+        }
+    }
 }
 
 pub trait Readable<'a>: Sized {

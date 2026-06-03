@@ -18,7 +18,11 @@ The crate is `no_std` compatible but requires an allocator to be available.
 # Example
 This short example shows you how to load a PDF file and iterate over the content streams of all
 pages.
-```rust
+
+(The vendored mangwhap copy of this crate ships only a small subset of `hayro-tests/pdfs/custom/`
+fixtures, so this example is `no_run`. The upstream copy at
+<https://github.com/jacquesg/hayro> executes it as-is.)
+```rust,no_run
 use hayro_syntax::Pdf;
 use std::path::PathBuf;
 

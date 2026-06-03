@@ -79,6 +79,10 @@ pub(crate) mod flate {
             code_size: u8,
             output: Vec<u8>,
             eof: bool,
+            /// Set when the decoded output exceeds
+            /// [`crate::filter::MAX_DECOMPRESSED_BYTES`]; the stream is
+            /// then rejected outright rather than truncated. V1-FUZZ-001.
+            bombed: bool,
         }
 
         impl<'a> FlateStream<'a> {
@@ -90,12 +94,17 @@ pub(crate) mod flate {
                     code_size: 0,
                     output: Vec::new(),
                     eof: false,
+                    bombed: false,
                 }
             }
 
             fn decode(&mut self) -> Option<Vec<u8>> {
                 while !self.eof && self.pos < self.data.len() {
                     self.read_block();
+                }
+
+                if self.bombed {
+                    return None;
                 }
 
                 Some(core::mem::take(&mut self.output))
@@ -253,7 +262,14 @@ pub(crate) mod flate {
                 } else {
                     let block = self.get_bytes(block_len as usize);
                     self.output.extend_from_slice(&block);
-                    if block.len() < block_len as usize {
+                    if self.output.len() > crate::filter::MAX_DECOMPRESSED_BYTES {
+                        warn!(
+                            "flate stream exceeds maximum decompressed size of {} bytes",
+                            crate::filter::MAX_DECOMPRESSED_BYTES
+                        );
+                        self.bombed = true;
+                        self.eof = true;
+                    } else if block.len() < block_len as usize {
                         self.eof = true;
                     }
                 }
@@ -273,6 +289,16 @@ pub(crate) mod flate {
                 };
 
                 loop {
+                    if self.output.len() > crate::filter::MAX_DECOMPRESSED_BYTES {
+                        warn!(
+                            "flate stream exceeds maximum decompressed size of {} bytes",
+                            crate::filter::MAX_DECOMPRESSED_BYTES
+                        );
+                        self.bombed = true;
+                        self.eof = true;
+                        return;
+                    }
+
                     let code1 = match self.get_code(&lit_code_table) {
                         Some(c) => c,
                         None => {
@@ -590,6 +616,14 @@ pub(crate) mod lzw {
         let mut prev = None;
 
         loop {
+            if decoded.len() > crate::filter::MAX_DECOMPRESSED_BYTES {
+                warn!(
+                    "LZW stream exceeds maximum decompressed size of {} bytes",
+                    crate::filter::MAX_DECOMPRESSED_BYTES
+                );
+                return None;
+            }
+
             let next = match reader.read(bit_size) {
                 Some(code) => code as usize,
                 None => {
