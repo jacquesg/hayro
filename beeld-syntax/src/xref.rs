@@ -291,6 +291,25 @@ impl XRef {
             XRefInput::RootRef(_) => None,
         };
 
+        // Streaming sources bound each object's on-demand read at the next
+        // object's offset; precompute the sorted offset index here (resident
+        // sources read the whole buffer and leave it empty).
+        let sorted_offsets = if data.is_streamed() {
+            let mut offsets: Vec<u64> = xref_map
+                .values()
+                .filter_map(|entry| match entry {
+                    EntryType::Normal { offset } => Some(*offset as u64),
+                    _ => None,
+                })
+                .collect();
+            offsets.sort_unstable();
+            offsets.dedup();
+            offsets.push(data.len());
+            offsets
+        } else {
+            Vec::new()
+        };
+
         let mut xref = Self(Inner::Some(Arc::new(SomeRepr {
             data: Arc::new(Data::new(data)),
             map: Arc::new(RwLock::new(MapRepr { xref_map, repaired })),
@@ -300,6 +319,7 @@ impl XRef {
             trailer_data,
             trailer_dict_bytes,
             password: password.to_vec(),
+            sorted_offsets,
         })));
 
         // We read the trailer twice, once to determine the encryption used and then a second
@@ -856,20 +876,72 @@ impl XRef {
             return None;
         };
 
-        let locked = repr.map.try_get().unwrap();
-
-        let mut r = Reader::new(repr.data.get().as_ref());
-
-        let entry = *locked.xref_map.get(&id).or({
+        let entry = {
+            let locked = repr.map.try_get().unwrap();
             // An indirect reference to an undefined object shall not be considered an error by a PDF processor; it
             // shall be treated as a reference to the null object.
-            None
-        })?;
-        drop(locked);
+            match locked.xref_map.get(&id) {
+                Some(entry) => *entry,
+                None => return None,
+            }
+        };
 
         let mut ctx = ctx.clone();
         ctx.set_obj_number(id);
         ctx.set_in_content_stream(false);
+
+        // Streaming source: read only the bytes each object needs, rather
+        // than borrowing the whole (non-resident) buffer. The resident path
+        // below is byte-for-byte unchanged.
+        if repr.data.get().is_streamed() {
+            return match entry {
+                EntryType::Free { .. } => None,
+                EntryType::Normal { offset } => {
+                    ctx.set_in_object_stream(false);
+                    let end_bound = repr.next_object_bound(offset);
+                    if let Some(window) = repr.data.object_window(offset as u64, end_bound) {
+                        let mut r = Reader::new(window);
+                        if let Some(object) = r.read_with_context::<IndirectObject<T>>(&ctx) {
+                            if object.id() == &id {
+                                return Some(object.get());
+                            }
+                        } else if r
+                            .skip::<IndirectObject<Object<'_>>>(false)
+                            .is_some()
+                        {
+                            // Valid object, wrong type - a clean miss.
+                            return None;
+                        }
+                    }
+
+                    // The object window did not parse; fall back to a
+                    // whole-file repair (which materialises) once.
+                    if self.is_repaired() {
+                        error!(
+                            "attempt was made at repairing xref, but object {id:?} still couldn't be read"
+                        );
+                        None
+                    } else {
+                        warn!("broken xref, attempting to repair");
+                        self.repair();
+                        self.get_with::<T>(id, &ctx)
+                    }
+                }
+                EntryType::Compressed { obj_stream, index } => {
+                    let obj_stream_id = ObjectIdentifier::new(obj_stream, 0);
+                    if obj_stream_id == id {
+                        warn!("cycle detected in object stream");
+                        return None;
+                    }
+                    let stream = self.get_with::<Stream<'_>>(obj_stream_id, &ctx)?;
+                    let data = repr.data.get_with(obj_stream_id, &ctx)?;
+                    let object_stream = ObjectStream::new(stream, data, &ctx)?;
+                    object_stream.get(index)
+                }
+            };
+        }
+
+        let mut r = Reader::new(repr.data.get().as_ref());
 
         match entry {
             EntryType::Free { .. } => None,
@@ -963,6 +1035,70 @@ pub(crate) fn find_last_xref_pos(data: &[u8]) -> Option<usize> {
     finder.read_without_context::<i32>()?.try_into().ok()
 }
 
+/// Streaming variant of [`find_last_xref_pos`]: locate `startxref` by reading
+/// a growing tail window, instead of scanning the whole (non-resident) buffer.
+fn find_last_xref_pos_streamed(data: &PdfData, file_len: u64) -> Option<usize> {
+    // `startxref` lives in the final bytes of the file; a 1 MiB ceiling is far
+    // more than any conformant trailer needs.
+    const MAX_TAIL: u64 = 1 << 20;
+    let mut win = core::cmp::min(1024, file_len.max(1));
+    loop {
+        let start = file_len.saturating_sub(win);
+        let tail = data.read_range(start, win as usize);
+        if let Some(rel) = findr_needle(&tail, b"startxref") {
+            let mut finder = Reader::new(&tail);
+            finder.jump(rel);
+            finder.forward_tag(b"startxref")?;
+            finder.skip_white_spaces_and_comments();
+            return finder.read_without_context::<i32>()?.try_into().ok();
+        }
+        if start == 0 || win >= MAX_TAIL {
+            return None;
+        }
+        win = core::cmp::min(win * 2, file_len);
+    }
+}
+
+/// Streaming variant of [`root_xref`]: build the cross-reference table from
+/// bounded positioned reads of `data`, without materialising the whole file.
+///
+/// Only a single, non-hybrid xref section is handled here. Multi-section
+/// (`/Prev`) or hybrid (`/XRefStm`) files return [`XRefError::Unknown`] so the
+/// caller can fall back to a resident parse; object bodies are then still read
+/// on demand by [`XRef::get_with`]'s streaming path.
+pub(crate) fn root_xref_streamed(
+    data: PdfData,
+    password: &[u8],
+    file_len: u64,
+) -> Result<XRef, XRefError> {
+    let xref_pos = find_last_xref_pos_streamed(&data, file_len).ok_or(XRefError::Unknown)?;
+    let win_len = usize::try_from(file_len.saturating_sub(xref_pos as u64))
+        .map_err(|_| XRefError::Unknown)?;
+    // The window starts at the xref section, so `populate_xref_impl` reads it
+    // at relative offset 0. Object offsets it stores remain absolute file
+    // offsets (they are data values, not reader positions).
+    let window = data.read_range(xref_pos as u64, win_len);
+
+    let mut xref_map = FxHashMap::default();
+    let trailer = populate_xref_impl(&window, 0, &mut xref_map).ok_or(XRefError::Unknown)?;
+
+    // `/Prev` already aborted `populate_xref_impl` (its absolute offset falls
+    // outside the tail window); a `/XRefStm` would be silently skipped. Detect
+    // either in the trailer and defer to the resident fallback rather than
+    // risk an incomplete map.
+    if findr_needle(trailer, b"/Prev").is_some() || findr_needle(trailer, b"/XRefStm").is_some() {
+        return Err(XRefError::Unknown);
+    }
+
+    XRef::new(
+        data.clone(),
+        xref_map,
+        XRefInput::TrailerDictData(trailer),
+        false,
+        password,
+    )
+}
+
 /// The type of a cross-reference table entry.
 ///
 /// ISO 32000-1 §7.5.4 and §7.5.8 describe the three entry types.
@@ -1035,6 +1171,23 @@ struct SomeRepr {
     /// when the xref was built from a [`XRefInput::RootRef`] fallback,
     /// i.e. the original trailer could not be read.
     trailer_dict_bytes: Option<Arc<[u8]>>,
+    /// For a streaming source only: every `Normal` object's byte offset,
+    /// sorted ascending, with the file length appended as a sentinel. Used
+    /// to bound each object's on-demand read at the next object's start -
+    /// objects are non-overlapping, so `[offset, next)` contains the whole
+    /// object. Empty for a resident source.
+    sorted_offsets: Vec<u64>,
+}
+
+impl SomeRepr {
+    /// The exclusive end of the byte window for the streamed object at
+    /// `offset`: the next `Normal` offset strictly greater than `offset`, or
+    /// the file length. See [`SomeRepr::sorted_offsets`].
+    fn next_object_bound(&self, offset: usize) -> u64 {
+        let off = offset as u64;
+        let idx = self.sorted_offsets.partition_point(|&o| o <= off);
+        self.sorted_offsets.get(idx).copied().unwrap_or(off)
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -7,7 +7,7 @@ use crate::page::Pages;
 use crate::page::cached::CachedPages;
 use crate::reader::Reader;
 use crate::sync::Arc;
-use crate::xref::{XRef, XRefError, fallback, root_xref};
+use crate::xref::{XRef, XRefError, fallback, root_xref, root_xref_streamed};
 
 pub use crate::crypto::DecryptionError;
 use crate::metadata::Metadata;
@@ -49,6 +49,19 @@ impl Pdf {
         password: &str,
     ) -> Result<Self, LoadPdfError> {
         let data = data.into();
+
+        // Streaming source: try a bounded open that reads only what it needs.
+        // Fall back to a resident parse (materialise) for multi-section /
+        // hybrid / malformed xref, so `get_with` uses the resident path and
+        // never double-reads.
+        if data.is_streamed() {
+            if let Some(pdf) = Self::try_open_streamed(&data, password) {
+                return Ok(pdf);
+            }
+            let len = usize::try_from(data.len()).unwrap_or(usize::MAX);
+            return Self::new_with_password(PdfData::from(data.read_range(0, len)), password);
+        }
+
         let password = password.as_bytes();
         let version = find_version(data.as_ref()).unwrap_or(PdfVersion::Pdf10);
         let xref = match root_xref(data.clone(), password) {
@@ -121,6 +134,31 @@ impl Pdf {
         password: &str,
     ) -> Result<Self, LoadPdfError> {
         Self::new_with_password(PdfData::streamed(source), password)
+    }
+
+    /// Bounded streaming open: parse the version, xref table and page tree
+    /// from positioned reads of `data` without materialising the whole file.
+    /// Returns `None` when the file needs a resident parse (multi-section /
+    /// hybrid / malformed xref), so the caller can fall back.
+    fn try_open_streamed(data: &PdfData, password: &str) -> Option<Self> {
+        let file_len = data.len();
+        let head_len = core::cmp::min(2000, usize::try_from(file_len).unwrap_or(usize::MAX));
+        let head = data.read_range(0, head_len);
+        let version = find_version(&head).unwrap_or(PdfVersion::Pdf10);
+
+        let xref = root_xref_streamed(data.clone(), password.as_bytes(), file_len).ok()?;
+        let xref = Arc::new(xref);
+        let pages = CachedPages::new(xref.clone())?;
+
+        Some(Self {
+            xref,
+            header_version: version,
+            pages,
+            data: data.clone(),
+            #[cfg(feature = "inspect")]
+            layout: crate::sync::OnceLock::new(),
+            linearization: crate::sync::OnceLock::new(),
+        })
     }
 
     /// Return the number of objects present in the PDF file.
@@ -415,6 +453,34 @@ mod tests {
         assert_eq!(
             resident_ops, streamed_ops,
             "streamed parse must match resident parse operator-for-operator",
+        );
+    }
+
+    /// Opening a streamed document and walking its page tree must read far
+    /// less than the whole file — the page content streams are not touched, so
+    /// streaming genuinely avoids buffering the entire file.
+    #[test]
+    fn streamed_open_reads_less_than_whole_file() {
+        let bytes: &[u8] =
+            include_bytes!("../../hayro-tests/pdfs/custom/andler-optimal-lot-size.pdf");
+
+        let bytes_read = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let source = CountingReadAt {
+            data: bytes.to_vec(),
+            bytes_read: bytes_read.clone(),
+        };
+        let pdf = Pdf::new_with_reader(source).expect("streamed fixture loads");
+
+        // Touch the page tree (catalog -> pages -> page dicts), but NOT the
+        // page content streams.
+        let page_count = pdf.pages().iter().count();
+        assert!(page_count >= 1, "fixture must have at least one page");
+
+        let read = bytes_read.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            read < bytes.len() as u64,
+            "streaming open read {read} of {} bytes - expected a bounded read",
+            bytes.len(),
         );
     }
 }
