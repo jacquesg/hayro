@@ -1,6 +1,7 @@
 //! The starting point for reading PDF files.
 
 use crate::PdfData;
+use crate::ReadAt;
 use crate::object::{Dict, Object};
 use crate::page::Pages;
 use crate::page::cached::CachedPages;
@@ -72,6 +73,54 @@ impl Pdf {
             layout: crate::sync::OnceLock::new(),
             linearization: crate::sync::OnceLock::new(),
         })
+    }
+
+    /// Try to read a PDF from a positioned-read [`ReadAt`] source, parsing
+    /// it on demand instead of from a fully-resident buffer.
+    ///
+    /// PDF is a random-access format, so the trailer and cross-reference
+    /// table are read with bounded reads and each accessed object's byte
+    /// range is fetched as needed — a large document does not have to be
+    /// held wholly in memory. A malformed file whose xref must be rebuilt by
+    /// brute force falls back to a full read (see [`crate::ReadAt`]).
+    ///
+    /// Returns `Err` if it was unable to read it.
+    #[cfg(feature = "std")]
+    pub fn new_with_reader<S: ReadAt + Send + Sync + 'static>(
+        source: S,
+    ) -> Result<Self, LoadPdfError> {
+        Self::new_with_password(PdfData::streamed(source), "")
+    }
+
+    /// Try to read a PDF from a positioned-read [`ReadAt`] source.
+    ///
+    /// Returns `Err` if it was unable to read it.
+    #[cfg(not(feature = "std"))]
+    pub fn new_with_reader<S: ReadAt + 'static>(source: S) -> Result<Self, LoadPdfError> {
+        Self::new_with_password(PdfData::streamed(source), "")
+    }
+
+    /// Try to read a password-protected PDF from a positioned-read
+    /// [`ReadAt`] source.
+    ///
+    /// Returns `Err` if it was unable to read it or if the password is
+    /// incorrect.
+    #[cfg(feature = "std")]
+    pub fn new_with_reader_and_password<S: ReadAt + Send + Sync + 'static>(
+        source: S,
+        password: &str,
+    ) -> Result<Self, LoadPdfError> {
+        Self::new_with_password(PdfData::streamed(source), password)
+    }
+
+    /// Try to read a password-protected PDF from a positioned-read
+    /// [`ReadAt`] source.
+    #[cfg(not(feature = "std"))]
+    pub fn new_with_reader_and_password<S: ReadAt + 'static>(
+        source: S,
+        password: &str,
+    ) -> Result<Self, LoadPdfError> {
+        Self::new_with_password(PdfData::streamed(source), password)
     }
 
     /// Return the number of objects present in the PDF file.
@@ -298,5 +347,74 @@ mod tests {
         let pdf = Pdf::new(data).unwrap();
 
         assert_eq!(pdf.version(), PdfVersion::Pdf14);
+    }
+
+    // --- streaming (ReadAt) ingress ---
+
+    /// A [`crate::ReadAt`] source over an in-memory buffer that counts the
+    /// bytes it serves, so a test can assert how much of the file the
+    /// streaming parse actually touched.
+    struct CountingReadAt {
+        data: Vec<u8>,
+        bytes_read: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl crate::ReadAt for CountingReadAt {
+        fn len(&self) -> u64 {
+            self.data.len() as u64
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, crate::ReadAtError> {
+            let start = (offset as usize).min(self.data.len());
+            let avail = &self.data[start..];
+            let n = avail.len().min(buf.len());
+            buf[..n].copy_from_slice(&avail[..n]);
+            self.bytes_read
+                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            Ok(n)
+        }
+    }
+
+    fn page_op_counts(pdf: &Pdf) -> Vec<usize> {
+        pdf.pages()
+            .iter()
+            .map(|page| {
+                let mut ops = page.typed_operations();
+                let mut n = 0;
+                while ops.next().is_some() {
+                    n += 1;
+                }
+                n
+            })
+            .collect()
+    }
+
+    /// A document parsed from a [`crate::ReadAt`] source must yield exactly
+    /// the same pages and content-stream operators as the same bytes parsed
+    /// from a resident buffer.
+    #[test]
+    fn streamed_parse_matches_resident() {
+        let bytes: &[u8] =
+            include_bytes!("../../hayro-tests/pdfs/custom/andler-optimal-lot-size.pdf");
+
+        let resident = Pdf::new(bytes.to_vec()).expect("resident fixture loads");
+
+        let bytes_read = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let source = CountingReadAt {
+            data: bytes.to_vec(),
+            bytes_read: bytes_read.clone(),
+        };
+        let streamed = Pdf::new_with_reader(source).expect("streamed fixture loads");
+
+        let resident_ops = page_op_counts(&resident);
+        let streamed_ops = page_op_counts(&streamed);
+        assert!(
+            !streamed_ops.is_empty(),
+            "fixture must have at least one page"
+        );
+        assert_eq!(
+            resident_ops, streamed_ops,
+            "streamed parse must match resident parse operator-for-operator",
+        );
     }
 }

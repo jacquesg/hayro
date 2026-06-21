@@ -88,6 +88,7 @@ pub(crate) mod sync;
 mod data;
 pub(crate) mod filter;
 pub(crate) mod pdf;
+mod read_at;
 pub(crate) mod trivia;
 pub(crate) mod util;
 
@@ -114,3 +115,4 @@ pub mod reader;
 pub use data::PdfData;
 pub use filter::*;
 pub use pdf::*;
+pub use read_at::{ReadAt, ReadAtError};
