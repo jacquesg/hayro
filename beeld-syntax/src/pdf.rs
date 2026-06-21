@@ -483,4 +483,41 @@ mod tests {
             bytes.len(),
         );
     }
+
+    /// A linearized document has a multi-section cross-reference (the main
+    /// table plus a `/Prev`-chained first-page table). It must stream too -
+    /// parse identically to the resident path AND, when only the page tree is
+    /// walked, read less than the whole file - rather than falling back to a
+    /// resident parse.
+    #[test]
+    fn streamed_multi_section_xref_streams() {
+        let bytes: &[u8] =
+            include_bytes!("../../hayro-tests/pdfs/custom/andler-optimal-lot-size_linearized.pdf");
+
+        let resident = Pdf::new(bytes.to_vec()).expect("resident fixture loads");
+        let streamed = Pdf::new_with_reader(CountingReadAt {
+            data: bytes.to_vec(),
+            bytes_read: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        })
+        .expect("streamed fixture loads");
+        assert_eq!(
+            page_op_counts(&resident),
+            page_op_counts(&streamed),
+            "streamed multi-section parse must match resident parse",
+        );
+
+        let bytes_read = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let pdf = Pdf::new_with_reader(CountingReadAt {
+            data: bytes.to_vec(),
+            bytes_read: bytes_read.clone(),
+        })
+        .expect("streamed fixture loads");
+        assert!(pdf.pages().iter().count() >= 1);
+        let read = bytes_read.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            read < bytes.len() as u64,
+            "multi-section streaming open read {read} of {} bytes - expected bounded reads, not a resident fallback",
+            bytes.len(),
+        );
+    }
 }
