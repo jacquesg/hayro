@@ -1064,41 +1064,250 @@ fn find_last_xref_pos_streamed(data: &PdfData, file_len: u64) -> Option<usize> {
 /// Streaming variant of [`root_xref`]: build the cross-reference table from
 /// bounded positioned reads of `data`, without materialising the whole file.
 ///
-/// Only a single, non-hybrid xref section is handled here. Multi-section
-/// (`/Prev`) or hybrid (`/XRefStm`) files return [`XRefError::Unknown`] so the
-/// caller can fall back to a resident parse; object bodies are then still read
-/// on demand by [`XRef::get_with`]'s streaming path.
+/// Each xref section (the root, plus every `/Prev` and `/XRefStm` it chains
+/// to) is read in its own window at its absolute offset, so incrementally
+/// updated / signed (multi-section) and hybrid files stream too. A single
+/// section larger than [`STREAM_SECTION_WINDOW`], or a malformed xref, returns
+/// [`XRefError::Unknown`] so the caller can fall back to a resident parse.
 pub(crate) fn root_xref_streamed(
     data: PdfData,
     password: &[u8],
     file_len: u64,
 ) -> Result<XRef, XRefError> {
     let xref_pos = find_last_xref_pos_streamed(&data, file_len).ok_or(XRefError::Unknown)?;
-    let win_len = usize::try_from(file_len.saturating_sub(xref_pos as u64))
-        .map_err(|_| XRefError::Unknown)?;
-    // The window starts at the xref section, so `populate_xref_impl` reads it
-    // at relative offset 0. Object offsets it stores remain absolute file
-    // offsets (they are data values, not reader positions).
-    let window = data.read_range(xref_pos as u64, win_len);
-
     let mut xref_map = FxHashMap::default();
-    let trailer = populate_xref_impl(&window, 0, &mut xref_map).ok_or(XRefError::Unknown)?;
-
-    // `/Prev` already aborted `populate_xref_impl` (its absolute offset falls
-    // outside the tail window); a `/XRefStm` would be silently skipped. Detect
-    // either in the trailer and defer to the resident fallback rather than
-    // risk an incomplete map.
-    if findr_needle(trailer, b"/Prev").is_some() || findr_needle(trailer, b"/XRefStm").is_some() {
-        return Err(XRefError::Unknown);
-    }
+    let trailer = populate_xref_streamed(&data, xref_pos, file_len, &mut xref_map)
+        .ok_or(XRefError::Unknown)?;
 
     XRef::new(
         data.clone(),
         xref_map,
-        XRefInput::TrailerDictData(trailer),
+        XRefInput::TrailerDictData(&trailer),
         false,
         password,
     )
+}
+
+/// Ceiling on a single xref section's read window for the streaming parse. The
+/// window grows from a small read until the section's own structure parses; a
+/// section that needs more than this falls back to a resident parse (real
+/// documents keep each section far smaller). The cap also bounds the wasted
+/// read when a section is malformed.
+const STREAM_SECTION_MAX: u64 = 16 << 20;
+
+/// Read a window that just covers the xref section at `pos`, growing from a
+/// small read until the section's own structure parses (the xref stream object,
+/// or the classic table plus its trailer). Sizing to the section - rather than
+/// reading a fixed slab to EOF - keeps a `/Prev` section near the file's front
+/// from pulling in most of the file. Returns `None` if the section never parses
+/// within [`STREAM_SECTION_MAX`] (malformed / over-large -> resident fallback).
+fn size_section_window(data: &PdfData, pos: usize, avail: u64) -> Option<Vec<u8>> {
+    let ceiling = core::cmp::min(avail, STREAM_SECTION_MAX);
+    let mut win: u64 = 4096;
+    loop {
+        let capped = win.min(ceiling);
+        let window = data.read_range(pos as u64, usize::try_from(capped).ok()?);
+
+        let mut probe = Reader::new(&window);
+        probe.skip_white_spaces_and_comments();
+        let fits = if probe
+            .clone()
+            .read_without_context::<ObjectIdentifier>()
+            .is_some()
+        {
+            // xref stream: the whole stream object (dict + body) must parse.
+            probe
+                .clone()
+                .read_with_context::<IndirectObject<Stream<'_>>>(&ReaderContext::dummy())
+                .is_some()
+        } else {
+            // classic table: the entries and the trailer dict after them must
+            // fit (`read_xref_table_trailer` jumps the entries, then parses the
+            // trailer - it fails if either overruns the window).
+            read_xref_table_trailer(&mut probe.clone(), &ReaderContext::dummy()).is_some()
+        };
+
+        if fits {
+            return Some(window);
+        }
+        if capped >= ceiling {
+            return None;
+        }
+        win = win.saturating_mul(2);
+    }
+}
+
+/// Streaming counterpart of [`populate_xref_impl`]: build the xref map and
+/// return the trailer dictionary as owned bytes (the resident path borrows the
+/// whole buffer, which a streaming source has not got). Each section's window
+/// is read from `data` on demand; `/Prev` and `/XRefStm` are followed to their
+/// absolute offsets in fresh windows. Returns `None` for a malformed or
+/// over-large section so the caller can fall back to a resident parse.
+fn populate_xref_streamed(
+    data: &PdfData,
+    pos: usize,
+    file_len: u64,
+    xref_map: &mut XrefMap,
+) -> Option<Vec<u8>> {
+    let mut visited = BTreeSet::new();
+    populate_xref_streamed_inner(data, pos, file_len, xref_map, &mut visited)
+}
+
+fn populate_xref_streamed_inner(
+    data: &PdfData,
+    pos: usize,
+    file_len: u64,
+    xref_map: &mut XrefMap,
+    visited: &mut BTreeSet<usize>,
+) -> Option<Vec<u8>> {
+    if !visited.insert(pos) {
+        warn!("circular xref PREV chain detected at offset {}", pos);
+        return None;
+    }
+    if visited.len() > MAX_XREF_CHAIN_DEPTH {
+        warn!(
+            "xref PREV chain exceeds maximum depth of {}",
+            MAX_XREF_CHAIN_DEPTH
+        );
+        return None;
+    }
+
+    let avail = file_len.checked_sub(pos as u64)?;
+    // Window sized to this section (reads are at relative offset 0; the object
+    // / `/Prev` / `/XRefStm` offsets it records or follows stay absolute).
+    let window = size_section_window(data, pos, avail)?;
+
+    let mut reader = Reader::new(&window);
+    // In case the position points to before the object number of a xref stream.
+    reader.skip_white_spaces_and_comments();
+
+    let mut r2 = reader.clone();
+    if reader
+        .clone()
+        .read_without_context::<ObjectIdentifier>()
+        .is_some()
+    {
+        populate_from_xref_stream_streamed(data, file_len, &mut r2, xref_map, visited)
+    } else {
+        populate_from_xref_table_streamed(data, file_len, &mut r2, xref_map, visited)
+    }
+}
+
+/// Streaming counterpart of [`populate_from_xref_table`].
+fn populate_from_xref_table_streamed(
+    data: &PdfData,
+    file_len: u64,
+    reader: &mut Reader<'_>,
+    insert_map: &mut XrefMap,
+    visited: &mut BTreeSet<usize>,
+) -> Option<Vec<u8>> {
+    let trailer = {
+        let mut reader = reader.clone();
+        read_xref_table_trailer(&mut reader, &ReaderContext::dummy())?
+    };
+
+    reader.skip_white_spaces();
+    reader.forward_tag(b"xref")?;
+    reader.skip_white_spaces();
+
+    if let Some(prev) = trailer.get::<i32>(PREV) {
+        populate_xref_streamed_inner(data, prev as usize, file_len, insert_map, visited)?;
+    }
+
+    while let Some(header) = reader.read_without_context::<SubsectionHeader>() {
+        reader.skip_white_spaces();
+
+        let start = header.start;
+        let end = start + header.num_entries;
+
+        for obj_number in start..end {
+            let bytes = reader.read_bytes(XREF_ENTRY_LEN)?;
+            let entry = XRefEntry::read(bytes)?;
+
+            if entry.used {
+                insert_map.insert(
+                    ObjectIdentifier::new(obj_number as i32, entry.gen_number),
+                    EntryType::Normal {
+                        offset: entry.offset,
+                    },
+                );
+            } else {
+                let next_free = i32::try_from(entry.offset).unwrap_or(i32::MAX);
+                let generation = u16::try_from(entry.gen_number).unwrap_or(u16::MAX);
+                insert_map.insert(
+                    ObjectIdentifier::new(obj_number as i32, entry.gen_number),
+                    EntryType::Free {
+                        next_free,
+                        generation,
+                    },
+                );
+            }
+        }
+    }
+
+    if let Some(xref_stm) = trailer.get::<i32>(XREF_STM) {
+        let _ =
+            populate_xref_streamed_inner(data, xref_stm as usize, file_len, insert_map, visited);
+    }
+
+    Some(trailer.data().to_vec())
+}
+
+/// Streaming counterpart of [`populate_from_xref_stream`].
+fn populate_from_xref_stream_streamed(
+    data: &PdfData,
+    file_len: u64,
+    reader: &mut Reader<'_>,
+    insert_map: &mut XrefMap,
+    visited: &mut BTreeSet<usize>,
+) -> Option<Vec<u8>> {
+    let stream = reader
+        .read_with_context::<IndirectObject<Stream<'_>>>(&ReaderContext::dummy())?
+        .get();
+
+    if let Some(prev) = stream.dict().get::<i32>(PREV) {
+        let _ = populate_xref_streamed_inner(data, prev as usize, file_len, insert_map, visited)?;
+    }
+
+    let size = stream.dict().get::<u32>(SIZE)?;
+    let [f1_len, f2_len, f3_len] = stream.dict().get::<[u8; 3]>(W)?;
+
+    if f2_len > size_of::<u64>() as u8 {
+        error!("xref offset length is larger than the allowed limit");
+        return None;
+    }
+    if f1_len != 1 {
+        warn!("first field in xref stream was longer than 1");
+    }
+
+    let xref_data = stream.decoded().ok()?;
+    let mut xref_reader = Reader::new(xref_data.as_ref());
+
+    if let Some(arr) = stream.dict().get::<Array<'_>>(INDEX) {
+        for (start, num_elements) in arr.iter::<(u32, u32)>() {
+            xref_stream_subsection(
+                &mut xref_reader,
+                start,
+                num_elements,
+                f1_len,
+                f2_len,
+                f3_len,
+                insert_map,
+            )?;
+        }
+    } else {
+        xref_stream_subsection(
+            &mut xref_reader,
+            0,
+            size,
+            f1_len,
+            f2_len,
+            f3_len,
+            insert_map,
+        )?;
+    }
+
+    Some(stream.dict().data().to_vec())
 }
 
 /// The type of a cross-reference table entry.
