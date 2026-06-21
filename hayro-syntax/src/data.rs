@@ -110,6 +110,26 @@ impl PdfData {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Whether this is a streaming (positioned-read) source.
+    pub(crate) fn is_streamed(&self) -> bool {
+        matches!(self.inner, PdfDataInner::Streamed(_))
+    }
+
+    /// Read the byte range `[offset, offset + len)` into an owned buffer,
+    /// truncated at end-of-file. For a resident source this copies the
+    /// slice; for a streamed source it issues a positioned read.
+    pub(crate) fn read_range(&self, offset: u64, len: usize) -> Vec<u8> {
+        match &self.inner {
+            PdfDataInner::Resident(b) => {
+                let all = (**b).as_ref();
+                let start = usize::try_from(offset).unwrap_or(usize::MAX).min(all.len());
+                let end = start.saturating_add(len).min(all.len());
+                all[start..end].to_vec()
+            }
+            PdfDataInner::Streamed(s) => s.source.read_range(offset, len).unwrap_or_default(),
+        }
+    }
 }
 
 impl AsRef<[u8]> for PdfData {
@@ -163,6 +183,12 @@ pub(crate) struct Data {
     // 32 segments are more than enough as we can't have more objects than this.
     decoded: SegmentList<Option<Vec<u8>>, 32>,
     map: Mutex<HashMap<ObjectIdentifier, usize>>,
+    // Streaming object-window cache: each accessed object's byte range is
+    // pread from the source once and served as `&[u8]` with the same
+    // lifetime as the decoded-object-stream arena above (stable addresses,
+    // `&self`-insert). Empty/unused for a resident source.
+    windows: SegmentList<Vec<u8>, 32>,
+    window_map: Mutex<HashMap<u64, usize>>,
 }
 
 impl Debug for Data {
@@ -178,6 +204,8 @@ impl Data {
             data,
             decoded: SegmentList::new(),
             map: Mutex::new(HashMap::new()),
+            windows: SegmentList::new(),
+            window_map: Mutex::new(HashMap::new()),
         }
     }
 
@@ -205,5 +233,29 @@ impl Data {
                 })
                 .as_deref()
         }
+    }
+
+    /// Read the byte window `[offset, end_bound)` for a streamed object,
+    /// caching it in the window arena so the returned `&[u8]` lives as long
+    /// as `&self` (stable addresses, like the decoded-object-stream arena).
+    /// Re-entrancy-safe: the map lock is released before the positioned read
+    /// (which goes through `&self`), so a nested object resolution - e.g. an
+    /// indirect `/Length` - does not deadlock.
+    pub(crate) fn object_window(&self, offset: u64, end_bound: u64) -> Option<&[u8]> {
+        if let Some(&idx) = self.window_map.get().get(&offset) {
+            return self.windows.get(idx).map(Vec::as_slice);
+        }
+        let idx = {
+            let mut locked = self.window_map.get();
+            let idx = locked.len();
+            locked.insert(offset, idx);
+            idx
+        };
+        let len = usize::try_from(end_bound.saturating_sub(offset)).ok()?;
+        Some(
+            self.windows
+                .get_or_init(idx, || self.data.read_range(offset, len))
+                .as_slice(),
+        )
     }
 }
