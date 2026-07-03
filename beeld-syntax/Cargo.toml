@@ -1,0 +1,47 @@
+[package]
+name = "beeld-syntax"
+version = "0.7.2"
+description = "A low-level crate for reading PDF files."
+authors = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+publish.workspace = true
+readme = "README.md"
+
+[features]
+default = ["std", "images"]
+std = ["beeld-jbig2?/std", "beeld-jpeg2000?/std", "dep:rustc-hash", "zune-jpeg?/std"]
+images = ["dep:zune-jpeg", "dep:beeld-ccitt", "dep:beeld-jbig2", "dep:beeld-jpeg2000"]
+unsafe = [
+    "std",
+    "dep:flate2",
+    "dep:memchr",
+    "beeld-jbig2?/simd",
+    "beeld-jpeg2000?/simd",
+    "zune-jpeg?/x86",
+    "zune-jpeg?/neon",
+]
+logging = ["dep:log", "beeld-jpeg2000?/logging"]
+
+[dependencies]
+log = { workspace = true, optional = true }
+rustc-hash = { workspace = true, optional = true }
+smallvec = { workspace = true }
+flate2 = { workspace = true, optional = true, features = ["zlib-rs"] }
+memchr = { workspace = true, optional = true }
+
+zune-jpeg = { workspace = true, optional = true }
+beeld-ccitt = { workspace = true, optional = true }
+beeld-jbig2 = { workspace = true, optional = true }
+beeld-jpeg2000 = { workspace = true, optional = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+sha2 = "0.10"
+md5 = "0.8"
+aes = "0.8.4"
+cbc = "0.1.2"

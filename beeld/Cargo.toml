@@ -1,0 +1,33 @@
+[package]
+name = "beeld"
+version = "0.7.0"
+description = "A rasterizer for PDF files."
+edition = { workspace = true }
+rust-version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+publish.workspace = true
+readme = "README.md"
+
+[dependencies]
+beeld-interpret = { workspace = true }
+kurbo = { workspace = true }
+image = { workspace = true, features = ["png"] }
+bytemuck = { workspace = true, features = ["bytemuck_derive"] }
+vello_cpu = { workspace = true }
+pic-scale = { workspace = true }
+rustc-hash = { workspace = true }
+
+[dev-dependencies]
+log = { workspace = true }
+
+[features]
+default = ["embed-fonts", "embed-cmaps"]
+embed-fonts = ["beeld-interpret/embed-fonts"]
+# Embed the 61 predefined cmaps into the binary. Adds about ~250KB of brotli-encoded data.
+embed-cmaps = ["beeld-interpret/embed-cmaps"]
+logging = ["beeld-interpret/logging"]
+
+[lints]
+workspace = true

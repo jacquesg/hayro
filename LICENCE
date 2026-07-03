@@ -1,0 +1,39 @@
+LicenseRef-Proprietary
+
+Copyright © Bloudraad. All rights reserved.
+
+beeld is a fork of hayro (https://github.com/LaurenzV/hayro), originally
+authored by Laurenz Stampfl and contributors. It combines proprietary code
+owned by Bloudraad with upstream code under permissive open-source licences, as
+set out below.
+
+== Upstream code — MIT OR Apache-2.0 ==
+
+All source code, assets, and documentation originating from upstream hayro
+remain licensed under the MIT licence OR the Apache Licence, Version 2.0, at
+your option, exactly as in the original project. Those terms, and the upstream
+copyright notices, are retained in LICENSE_MIT, LICENSE_APACHE, and NOTICE.md.
+Nothing in this licence revokes, narrows, or relicenses the rights granted by
+those licences over the upstream-authored portions of this work.
+
+== Modifications and new code — proprietary ==
+
+All modifications to upstream files, and all new files, authored by Bloudraad
+(the "Proprietary Portions") are proprietary and confidential and are the
+exclusive property of Bloudraad. No licence, express or implied, is granted to
+any party to use, copy, modify, merge, publish, distribute, sublicense, or sell
+the Proprietary Portions or the combined work, except under a separate written
+agreement signed by Bloudraad. Unauthorised use, reproduction, or distribution
+of the Proprietary Portions, in whole or in part, is strictly prohibited.
+
+The combined work (this repository as a whole) is NOT released under an
+open-source licence and may not be redistributed.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+The SPDX identifier `LicenseRef-Proprietary` is the value declared by the
+`license` field of every proprietary workspace member in Cargo.toml; the
+retained upstream licences (LICENSE_MIT, LICENSE_APACHE) continue to govern the
+upstream-authored portions.

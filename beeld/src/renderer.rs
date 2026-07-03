@@ -1,0 +1,1278 @@
+use crate::{RenderCache, derive_settings};
+use beeld_interpret::encode::{EncodedShadingPattern, EncodedShadingType};
+use beeld_interpret::font::Glyph;
+use beeld_interpret::gradient::SvgGradientKind;
+use beeld_interpret::pattern::Pattern;
+use beeld_interpret::{
+    BlendMode, CacheKey, ClipPath, Device, DrawMode, DrawProps, FillRule, ImageData,
+    ImageDrawProps, LumaData, MaskType, Paint, RgbData, SoftMask, StrokeProps,
+};
+use kurbo::{Affine, BezPath, Point, Rect, Shape, Vec2};
+use pic_scale::{
+    ImageSize, ImageStore, ImageStoreMut, PicScaleError, Resampling, ResamplingFunction, Scaler,
+};
+use rustc_hash::FxHashMap;
+use std::rc::Rc;
+use std::sync::Arc;
+use vello_cpu::color::palette::css::BLACK;
+use vello_cpu::color::{AlphaColor, DynamicColor, PremulRgba8, Srgb};
+use vello_cpu::peniko::{ColorStop, Compose, Fill, Gradient, ImageQuality, ImageSampler, Mix};
+use vello_cpu::{
+    Image, ImageSource, Mask, PaintType, Pixmap, RenderContext, RenderSettings, peniko,
+};
+
+pub(crate) struct Renderer {
+    pub(crate) ctx: RenderContext,
+    pub(crate) inside_pattern: bool,
+    pub(crate) soft_mask_cache: FxHashMap<u128, Mask>,
+    pub(crate) outline_cache: Rc<std::cell::RefCell<FxHashMap<u128, Rc<BezPath>>>>,
+    pub(crate) in_type3_glyph: bool,
+    pub(crate) scaler: Scaler,
+}
+
+#[derive(Clone, Copy)]
+enum ImagePixelFormat {
+    Luma,
+    Rgb,
+    Rgba,
+}
+
+struct SolidColorImage {
+    color: [u8; 3],
+    width: u32,
+    height: u32,
+    interpolate: bool,
+}
+
+enum RenderImageData {
+    Rgb(RgbData),
+    Luma(LumaData),
+    Solid(SolidColorImage),
+}
+
+impl From<ImageData> for RenderImageData {
+    fn from(value: ImageData) -> Self {
+        match value {
+            ImageData::Rgb(rgb) => Self::Rgb(rgb),
+            ImageData::Luma(luma) => Self::Luma(luma),
+        }
+    }
+}
+
+impl From<RgbData> for RenderImageData {
+    fn from(value: RgbData) -> Self {
+        Self::Rgb(value)
+    }
+}
+
+impl RenderImageData {
+    fn width(&self) -> u32 {
+        match self {
+            Self::Rgb(d) => d.width,
+            Self::Luma(d) => d.width,
+            Self::Solid(d) => d.width,
+        }
+    }
+
+    fn height(&self) -> u32 {
+        match self {
+            Self::Rgb(d) => d.height,
+            Self::Luma(d) => d.height,
+            Self::Solid(d) => d.height,
+        }
+    }
+
+    fn interpolate(&self) -> bool {
+        match self {
+            Self::Rgb(d) => d.interpolate,
+            Self::Luma(d) => d.interpolate,
+            Self::Solid(d) => d.interpolate,
+        }
+    }
+}
+
+impl Renderer {
+    pub(crate) fn new(
+        width: u16,
+        height: u16,
+        settings: RenderSettings,
+        cache: &RenderCache<'_>,
+    ) -> Self {
+        Self {
+            ctx: RenderContext::new_with(width, height, settings),
+            inside_pattern: false,
+            soft_mask_cache: FxHashMap::default(),
+            outline_cache: cache.outline_cache.clone(),
+            in_type3_glyph: false,
+            scaler: Scaler::new(ResamplingFunction::CatmullRom),
+        }
+    }
+
+    fn set_stroke_properties(&mut self, stroke_props: &StrokeProps, is_text: bool) {
+        let threshold = if is_text { 0.25 } else { 1.0 };
+
+        // Best-effort attempt to ensure a line width of at least 1.0, as required by the PDF
+        // specification. If we are stroking text, we reduce the threshold as it will otherwise
+        // lead to very bold-looking text at low resolutions.
+        let min_factor = max_factor(self.ctx.transform());
+        let mut line_width = stroke_props.line_width.max(0.01);
+        let transformed_width = line_width * min_factor;
+
+        // Only enforce line width if not inside of pattern or type 3 glyph.
+        if transformed_width < threshold && !self.inside_pattern && !self.in_type3_glyph {
+            line_width /= transformed_width;
+            line_width *= threshold;
+        }
+
+        let stroke = kurbo::Stroke {
+            width: line_width as f64,
+            join: stroke_props.line_join,
+            miter_limit: stroke_props.miter_limit as f64,
+            start_cap: stroke_props.line_cap,
+            end_cap: stroke_props.line_cap,
+            dash_pattern: stroke_props.dash_array.iter().map(|n| *n as f64).collect(),
+            dash_offset: stroke_props.dash_offset as f64,
+        };
+
+        self.ctx.set_stroke(stroke);
+    }
+
+    fn draw_image_with_alpha_mask(&mut self, image_data: RenderImageData, alpha_data: LumaData) {
+        let mask = {
+            let transform = *self.ctx.transform()
+                * Affine::scale_non_uniform(
+                    image_data.width() as f64 / alpha_data.width as f64,
+                    image_data.height() as f64 / alpha_data.height as f64,
+                );
+            let mut renderer = Self {
+                ctx: RenderContext::new_with(
+                    self.ctx.width(),
+                    self.ctx.height(),
+                    derive_settings(self.ctx.render_settings()),
+                ),
+                inside_pattern: false,
+                soft_mask_cache: FxHashMap::default(),
+                outline_cache: self.outline_cache.clone(),
+                in_type3_glyph: false,
+                scaler: self.scaler,
+            };
+            let mut mask_pix = Pixmap::new(self.ctx.width(), self.ctx.height());
+            let rgb_data = ImageData::Rgb(RgbData {
+                data: vec![0; alpha_data.width as usize * alpha_data.height as usize * 3],
+                width: alpha_data.width,
+                height: alpha_data.height,
+                interpolate: alpha_data.interpolate,
+                scale_factors: alpha_data.scale_factors,
+            });
+            renderer.ctx.set_transform(transform);
+            // Note that there is a circle between `draw_image` and `draw_image_with_alpha_mask`,
+            // but `draw_image_with_alpha_mask` is only called if the dimensions or interpolate
+            // values between alpha_data and rgb_data don't match, which they do here.
+            renderer.draw_image(rgb_data, Some(alpha_data));
+            renderer.ctx.flush();
+            let mut resources = vello_cpu::Resources::default();
+            renderer.ctx.render(&mut mask_pix, &mut resources);
+            Mask::new_alpha(&mask_pix)
+        };
+
+        self.ctx.push_mask_layer(mask);
+        self.draw_image(image_data, None);
+        self.ctx.pop_layer();
+    }
+
+    fn resize_image_data(
+        &self,
+        data: Vec<u8>,
+        src_width: u32,
+        src_height: u32,
+        new_width: u32,
+        new_height: u32,
+        pixel_format: ImagePixelFormat,
+    ) -> Vec<u8> {
+        match pixel_format {
+            ImagePixelFormat::Luma => self.resize_image_data_impl::<1>(
+                data,
+                src_width,
+                src_height,
+                new_width,
+                new_height,
+                |scaler, source_size, target_size| {
+                    scaler.plan_planar_resampling(source_size, target_size)
+                },
+            ),
+            ImagePixelFormat::Rgb => self.resize_image_data_impl::<3>(
+                data,
+                src_width,
+                src_height,
+                new_width,
+                new_height,
+                |scaler, source_size, target_size| {
+                    scaler.plan_rgb_resampling(source_size, target_size)
+                },
+            ),
+            ImagePixelFormat::Rgba => self.resize_image_data_impl::<4>(
+                data,
+                src_width,
+                src_height,
+                new_width,
+                new_height,
+                |scaler, source_size, target_size| {
+                    scaler.plan_rgba_resampling(source_size, target_size, true)
+                },
+            ),
+        }
+    }
+
+    fn resize_image_data_impl<const N: usize>(
+        &self,
+        data: Vec<u8>,
+        src_width: u32,
+        src_height: u32,
+        new_width: u32,
+        new_height: u32,
+        plan: impl FnOnce(
+            &Scaler,
+            ImageSize,
+            ImageSize,
+        ) -> Result<Arc<Resampling<u8, N>>, PicScaleError>,
+    ) -> Vec<u8> {
+        let source_size = ImageSize::new(src_width as usize, src_height as usize);
+        let target_size = ImageSize::new(new_width as usize, new_height as usize);
+        let src = ImageStore::<u8, N>::from_slice(&data, src_width as usize, src_height as usize)
+            .unwrap();
+        let mut out = vec![0; new_width as usize * new_height as usize * N];
+        let mut dst =
+            ImageStoreMut::<u8, N>::from_slice(&mut out, new_width as usize, new_height as usize)
+                .unwrap();
+        let plan = plan(&self.scaler, source_size, target_size).unwrap();
+        plan.resample(&src, &mut dst).unwrap();
+        out
+    }
+
+    fn draw_image(&mut self, image_data: impl Into<RenderImageData>, alpha_data: Option<LumaData>) {
+        let image_data = image_data.into();
+        let cur_transform = *self.ctx.transform();
+        let mut additional_transform = Affine::IDENTITY;
+
+        let (x_scale, y_scale) = {
+            let (x, y) = x_y_advances(&cur_transform);
+            (x.length() as f32, y.length() as f32)
+        };
+        let mut img_width = image_data.width();
+        let mut img_height = image_data.height();
+        let interpolate = image_data.interpolate();
+
+        if let Some(a) = &alpha_data
+            && (a.width != img_width || a.height != img_height || a.interpolate != interpolate)
+        {
+            return self.draw_image_with_alpha_mask(image_data, alpha_data.unwrap());
+        }
+
+        let mut quality = if interpolate {
+            ImageQuality::Medium
+        } else {
+            ImageQuality::Low
+        };
+
+        let has_alpha = alpha_data.is_some();
+        let mut may_have_transparency = has_alpha;
+        let needs_resize = x_scale < 1.0 || y_scale < 1.0;
+        let (new_width, new_height) = if needs_resize {
+            let w = (img_width as f32 * x_scale)
+                .ceil()
+                .max(1.0)
+                .min((u16::MAX / 2) as f32) as u32;
+            let h = (img_height as f32 * y_scale)
+                .ceil()
+                .max(1.0)
+                .min((u16::MAX / 2) as f32) as u32;
+            if self.in_type3_glyph {
+                quality = ImageQuality::High;
+            }
+            (w, h)
+        } else {
+            (img_width, img_height)
+        };
+
+        // For luma images without alpha, we can resize as single-channel and
+        // expand to RGBA afterwards, which is ~4x faster.
+        let mut rgba_data = if matches!(&image_data, RenderImageData::Solid(_)) && has_alpha {
+            let RenderImageData::Solid(solid) = image_data else {
+                unreachable!()
+            };
+            let alpha = alpha_data.unwrap();
+
+            let alpha_data = if !needs_resize {
+                alpha.data
+            } else {
+                let resized_alpha = self.resize_image_data(
+                    alpha.data,
+                    img_width,
+                    img_height,
+                    new_width,
+                    new_height,
+                    ImagePixelFormat::Luma,
+                );
+                additional_transform = Affine::scale_non_uniform(
+                    img_width as f64 / new_width as f64,
+                    img_height as f64 / new_height as f64,
+                );
+                img_width = new_width;
+                img_height = new_height;
+                resized_alpha
+            };
+
+            let mut out = Vec::with_capacity(img_width as usize * img_height as usize * 4);
+            for a in alpha_data {
+                out.extend_from_slice(&[solid.color[0], solid.color[1], solid.color[2], a]);
+            }
+            out
+        } else if matches!(&image_data, RenderImageData::Luma(_)) && !has_alpha {
+            // We cannot lift this up due to borrowing issues.
+            let RenderImageData::Luma(luma) = image_data else {
+                unreachable!()
+            };
+
+            let luma_data = if !needs_resize {
+                luma.data
+            } else {
+                let resized = self.resize_image_data(
+                    luma.data,
+                    img_width,
+                    img_height,
+                    new_width,
+                    new_height,
+                    ImagePixelFormat::Luma,
+                );
+                additional_transform = Affine::scale_non_uniform(
+                    img_width as f64 / new_width as f64,
+                    img_height as f64 / new_height as f64,
+                );
+                img_width = new_width;
+                img_height = new_height;
+                resized
+            };
+
+            luma_data
+                .iter()
+                .flat_map(|g| [*g, *g, *g, 255])
+                .collect::<Vec<_>>()
+        } else if matches!(&image_data, RenderImageData::Luma(_)) && has_alpha {
+            let RenderImageData::Luma(luma) = image_data else {
+                unreachable!()
+            };
+            let alpha = alpha_data.unwrap();
+
+            let (luma_data, alpha_data) = if !needs_resize {
+                (luma.data, alpha.data)
+            } else {
+                let resized_luma = self.resize_image_data(
+                    luma.data,
+                    img_width,
+                    img_height,
+                    new_width,
+                    new_height,
+                    ImagePixelFormat::Luma,
+                );
+                let resized_alpha = self.resize_image_data(
+                    alpha.data,
+                    img_width,
+                    img_height,
+                    new_width,
+                    new_height,
+                    ImagePixelFormat::Luma,
+                );
+                additional_transform = Affine::scale_non_uniform(
+                    img_width as f64 / new_width as f64,
+                    img_height as f64 / new_height as f64,
+                );
+                img_width = new_width;
+                img_height = new_height;
+                (resized_luma, resized_alpha)
+            };
+
+            let mut out = Vec::with_capacity(img_width as usize * img_height as usize * 4);
+            for (g, a) in luma_data.iter().zip(alpha_data) {
+                out.extend_from_slice(&[*g, *g, *g, a]);
+            }
+            out
+        } else if matches!(&image_data, RenderImageData::Rgb(_)) && !has_alpha && needs_resize {
+            let RenderImageData::Rgb(rgb) = image_data else {
+                unreachable!()
+            };
+
+            let resized = self.resize_image_data(
+                rgb.data,
+                img_width,
+                img_height,
+                new_width,
+                new_height,
+                ImagePixelFormat::Rgb,
+            );
+            additional_transform = Affine::scale_non_uniform(
+                img_width as f64 / new_width as f64,
+                img_height as f64 / new_height as f64,
+            );
+            img_width = new_width;
+            img_height = new_height;
+
+            let mut out = Vec::with_capacity((img_width * img_height) as usize * 4);
+            for px in resized.chunks_exact(3) {
+                out.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            }
+            out
+        } else {
+            let (rgb_data, alpha_data) = match image_data {
+                RenderImageData::Rgb(rgb) => (rgb.data, alpha_data.map(|a| a.data)),
+                RenderImageData::Luma(luma) => {
+                    let rgb = luma
+                        .data
+                        .iter()
+                        .flat_map(|g| [*g, *g, *g])
+                        .collect::<Vec<_>>();
+                    (rgb, alpha_data.map(|a| a.data))
+                }
+                RenderImageData::Solid(solid) => {
+                    let mut rgb =
+                        Vec::with_capacity(solid.width as usize * solid.height as usize * 3);
+                    for _ in 0..solid.width as usize * solid.height as usize {
+                        rgb.extend_from_slice(&solid.color);
+                    }
+                    (rgb, alpha_data.map(|a| a.data))
+                }
+            };
+
+            let rgba_data = match alpha_data {
+                None => rgb_data
+                    .chunks_exact(3)
+                    .flat_map(|rgb| [rgb[0], rgb[1], rgb[2], 255])
+                    .collect::<Vec<_>>(),
+                Some(alpha) => rgb_data
+                    .chunks_exact(3)
+                    .zip(alpha)
+                    .flat_map(|(rgb, a)| [rgb[0], rgb[1], rgb[2], a])
+                    .collect::<Vec<_>>(),
+            };
+
+            if !needs_resize {
+                rgba_data
+            } else {
+                let resized = self.resize_image_data(
+                    rgba_data,
+                    img_width,
+                    img_height,
+                    new_width,
+                    new_height,
+                    ImagePixelFormat::Rgba,
+                );
+                additional_transform = Affine::scale_non_uniform(
+                    img_width as f64 / new_width as f64,
+                    img_height as f64 / new_height as f64,
+                );
+                img_width = new_width;
+                img_height = new_height;
+                resized
+            }
+        };
+
+        if has_alpha {
+            let (chunks, _) = rgba_data.as_chunks_mut::<4>();
+            for chunk in chunks {
+                *chunk = AlphaColor::from_rgba8(chunk[0], chunk[1], chunk[2], chunk[3])
+                    .premultiply()
+                    .to_rgba8()
+                    .to_u8_array();
+            }
+        }
+
+        // The problem is that by default, when applying a bilinear or bicubic scaling, we will
+        // sample pixels using an extend (pad/reflect/repeat). For glyphs, this is undesirable
+        // as the glyphs will look very bold. Therefore, for glyphs it is more desirable to sample
+        // a transparent pixel when reaching the border. Thus, we wrap glyphs in a transparent frame
+        // of pixel width 2.
+        if self.in_type3_glyph {
+            let mut padded_image = vec![];
+            padded_image.extend(vec![0; (4 * img_width as usize + 16) * 2]);
+
+            for row in rgba_data.chunks_exact(img_width as usize * 4) {
+                padded_image.extend([0; 8]);
+                padded_image.extend(row);
+                padded_image.extend([0; 8]);
+            }
+
+            padded_image.extend(vec![0; (4 * img_width as usize + 16) * 2]);
+            img_width += 4;
+            img_height += 4;
+            additional_transform *= Affine::translate((-2.0, -2.0));
+            may_have_transparency = true;
+
+            rgba_data = padded_image;
+        }
+
+        let pixmap = Pixmap::from_parts_with_opacity(
+            bytemuck::cast_vec(rgba_data),
+            img_width as u16,
+            img_height as u16,
+            may_have_transparency,
+        );
+
+        self.draw_pixmap(
+            Arc::new(pixmap),
+            quality,
+            cur_transform * additional_transform,
+        );
+    }
+
+    fn push_clip_path_inner(&mut self, clip_path: &BezPath, fill: FillRule) {
+        let old_transform = *self.ctx.transform();
+
+        self.ctx.set_fill_rule(convert_fill_rule(fill));
+        self.ctx.set_transform(Affine::IDENTITY);
+        self.ctx.push_clip_path(clip_path);
+
+        self.ctx.set_transform(old_transform);
+    }
+
+    fn draw_pixmap(&mut self, pixmap: Arc<Pixmap>, quality: ImageQuality, transform: Affine) {
+        let (width, height) = (pixmap.width(), pixmap.height());
+        let image = Image {
+            image: ImageSource::Pixmap(pixmap),
+            sampler: ImageSampler {
+                x_extend: peniko::Extend::Pad,
+                y_extend: peniko::Extend::Pad,
+                quality,
+                alpha: 1.0,
+            },
+        };
+
+        self.ctx.set_transform(transform);
+        self.ctx.set_paint(image);
+        self.ctx
+            .fill_rect(&Rect::new(0.0, 0.0, width as f64, height as f64));
+    }
+
+    fn apply_soft_mask(&mut self, mask: Option<&SoftMask<'_>>) {
+        let settings = *self.ctx.render_settings();
+        let mask = mask.map(|m| {
+            let width = self.ctx.width();
+            let height = self.ctx.height();
+
+            self.soft_mask_cache
+                .entry(m.cache_key())
+                .or_insert_with(|| draw_soft_mask(m, settings, width, height))
+                .clone()
+        });
+
+        if let Some(mask) = mask {
+            self.ctx.set_mask(mask);
+        } else {
+            self.ctx.reset_mask();
+        }
+    }
+
+    fn apply_draw_props(&mut self, props: &DrawProps<'_>) {
+        self.ctx.set_transform(props.transform);
+        self.apply_soft_mask(props.soft_mask.as_ref());
+        self.ctx
+            .set_blend_mode(convert_blend_mode(props.blend_mode));
+    }
+
+    fn apply_image_props(&mut self, props: &ImageDrawProps<'_>) {
+        self.ctx.set_transform(props.transform);
+        self.apply_soft_mask(props.soft_mask.as_ref());
+        self.ctx
+            .set_blend_mode(convert_blend_mode(props.blend_mode));
+    }
+
+    #[must_use]
+    fn set_paint(
+        &mut self,
+        paint: &Paint<'_>,
+        path_bbox: impl Fn() -> Rect,
+        is_stroke: bool,
+    ) -> Option<BezPath> {
+        let mut paint_transform = Affine::IDENTITY;
+        let mut clip_path = None;
+
+        let paint: PaintType = match paint.clone() {
+            Paint::Color(c) => {
+                let c = c.to_rgba().to_rgba8();
+                AlphaColor::from_rgba8(c[0], c[1], c[2], c[3]).into()
+            }
+            Paint::Pattern(p) => {
+                let path_transform = self.ctx.transform();
+
+                match *p {
+                    Pattern::Shading(s) => {
+                        const NATIVE_GRADIENT_TOLERANCE: f32 = 0.01;
+
+                        clip_path = s.shading.clip_path.clone();
+                        let encoded = s.encode();
+                        let mut bbox = (*path_transform * path_bbox().to_path(0.0)).bounding_box();
+
+                        if is_stroke {
+                            // Try to account for stroke in bbox.
+                            let (a1, a2) = x_y_advances(path_transform);
+                            let factor = a1.length().max(a2.length()) * self.ctx.stroke().width;
+                            bbox = bbox.inflate(factor, factor);
+                        }
+
+                        bbox = bbox.intersect(Rect::new(
+                            0.0,
+                            0.0,
+                            self.ctx.width() as f64,
+                            self.ctx.height() as f64,
+                        ));
+
+                        if let EncodedShadingType::RadialAxial(gradient) = &encoded.shading_type
+                            && let Some(native) =
+                                gradient.as_svg_gradient(&encoded, bbox, NATIVE_GRADIENT_TOLERANCE)
+                        {
+                            paint_transform = path_transform.inverse()
+                                * Affine::translate((-0.5, -0.5))
+                                * native.transform;
+
+                            let stops = native
+                                .stops
+                                .iter()
+                                .map(|stop| ColorStop {
+                                    offset: stop.offset,
+                                    color: DynamicColor::from_alpha_color(AlphaColor::<Srgb>::new(
+                                        stop.color,
+                                    )),
+                                })
+                                .collect::<Vec<_>>();
+
+                            let gradient = match native.kind {
+                                SvgGradientKind::Linear { start, end } => {
+                                    Gradient::new_linear(start, end)
+                                }
+                                SvgGradientKind::Radial {
+                                    start_center,
+                                    start_radius,
+                                    end_center,
+                                    end_radius,
+                                } => Gradient::new_two_point_radial(
+                                    start_center,
+                                    start_radius,
+                                    end_center,
+                                    end_radius,
+                                ),
+                            }
+                            .with_extend(peniko::Extend::Pad)
+                            .with_stops(stops.as_slice());
+
+                            PaintType::Gradient(gradient)
+                        } else {
+                            let (image, width, height, transform, may_have_transparency) =
+                                render_shading_texture(bbox, &encoded);
+                            paint_transform = path_transform.inverse() * transform;
+
+                            let pixmap = Pixmap::from_parts_with_opacity(
+                                image,
+                                width as u16,
+                                height as u16,
+                                may_have_transparency,
+                            );
+
+                            let image = Image {
+                                image: ImageSource::Pixmap(Arc::new(pixmap)),
+                                sampler: ImageSampler {
+                                    x_extend: peniko::Extend::Repeat,
+                                    y_extend: peniko::Extend::Repeat,
+                                    quality: ImageQuality::Medium,
+                                    alpha: 1.0,
+                                },
+                            };
+
+                            PaintType::Image(image)
+                        }
+                    }
+                    Pattern::Tiling(t) => {
+                        const MAX_PIXMAP_SIZE: f32 = 3000.0;
+                        // TODO: Raise this limit and perform downsampling if reached
+                        // (see pdftc_100k_0138.pdf).
+                        const MIN_PIXMAP_SIZE: f32 = 1.0;
+
+                        let bbox = t.bbox;
+                        let max_x_scale = MAX_PIXMAP_SIZE / bbox.width() as f32;
+                        let min_x_scale = MIN_PIXMAP_SIZE / bbox.width() as f32;
+                        let max_y_scale = MAX_PIXMAP_SIZE / bbox.height() as f32;
+                        let min_y_scale = MIN_PIXMAP_SIZE / bbox.height() as f32;
+
+                        let (mut xs, mut ys) = {
+                            let (x, y) = x_y_advances(&(t.matrix));
+                            (x.length() as f32, y.length() as f32)
+                        };
+                        xs = xs.max(min_x_scale).min(max_x_scale);
+                        ys = ys.max(min_y_scale).min(max_y_scale);
+
+                        let x_step = xs * t.x_step;
+                        let y_step = ys * t.y_step;
+
+                        let scaled_width = bbox.width() as f32 * xs;
+                        let scaled_height = bbox.height() as f32 * ys;
+                        let pix_width = x_step.abs().round() as u16;
+                        let pix_height = y_step.abs().round() as u16;
+
+                        let mut renderer = Self {
+                            ctx: RenderContext::new_with(
+                                pix_width,
+                                pix_height,
+                                derive_settings(self.ctx.render_settings()),
+                            ),
+                            inside_pattern: true,
+                            soft_mask_cache: FxHashMap::default(),
+                            outline_cache: self.outline_cache.clone(),
+                            in_type3_glyph: false,
+                            scaler: self.scaler,
+                        };
+                        let mut initial_transform = Affine::scale_non_uniform(xs as f64, ys as f64)
+                            * Affine::translate((-bbox.x0, -bbox.y0));
+                        t.interpret(&mut renderer, initial_transform, is_stroke);
+                        let mut pix = Pixmap::new(pix_width, pix_height);
+                        renderer.ctx.flush();
+                        let mut resources = vello_cpu::Resources::default();
+                        renderer.ctx.render(&mut pix, &mut resources);
+
+                        // TODO: Fix these
+                        if x_step < 0.0 {
+                            initial_transform *=
+                                Affine::new([-1.0, 0.0, 0.0, 1.0, scaled_width as f64, 0.0]);
+                        }
+
+                        if y_step < 0.0 {
+                            initial_transform *=
+                                Affine::new([1.0, 0.0, 0.0, -1.0, 0.0, scaled_height as f64]);
+                        }
+
+                        paint_transform =
+                            path_transform.inverse() * t.matrix * initial_transform.inverse();
+
+                        let image = Image {
+                            image: ImageSource::Pixmap(Arc::new(pix)),
+                            sampler: ImageSampler {
+                                x_extend: peniko::Extend::Repeat,
+                                y_extend: peniko::Extend::Repeat,
+                                quality: ImageQuality::Medium,
+                                alpha: 1.0,
+                            },
+                        };
+
+                        PaintType::Image(image)
+                    }
+                }
+            }
+        };
+
+        self.ctx.set_paint_transform(paint_transform);
+        self.ctx.set_paint(paint);
+
+        clip_path
+    }
+
+    fn stroke_path(
+        &mut self,
+        path: &BezPath,
+        props: DrawProps<'_>,
+        stroke_props: &StrokeProps,
+        is_text: bool,
+    ) {
+        self.apply_draw_props(&props);
+        self.set_stroke_properties(stroke_props, is_text);
+
+        let clip_path = self.set_paint(&props.paint, || path.bounding_box(), true);
+        if let Some(clip_path) = clip_path.as_ref() {
+            self.push_clip_path_inner(clip_path, FillRule::NonZero);
+        }
+        self.ctx.stroke_path(path);
+        if clip_path.is_some() {
+            self.ctx.pop_clip_path();
+        }
+    }
+
+    fn fill_path(&mut self, path: &BezPath, props: DrawProps<'_>, fill_rule: FillRule) {
+        self.ctx.set_fill_rule(convert_fill_rule(fill_rule));
+        self.apply_draw_props(&props);
+
+        let clip_path = self.set_paint(&props.paint, || path.bounding_box(), false);
+        if let Some(clip_path) = clip_path.as_ref() {
+            self.push_clip_path_inner(clip_path, fill_rule);
+        }
+
+        self.ctx.fill_path(path);
+
+        if clip_path.is_some() {
+            self.ctx.pop_clip_path();
+        }
+    }
+
+    fn fill_glyph<'a>(&mut self, glyph: &Glyph<'a>, props: DrawProps<'a>, glyph_transform: Affine) {
+        match glyph {
+            Glyph::Outline(o) => {
+                let base_outline = self.cached_outline(o);
+                let props = DrawProps {
+                    transform: props.transform * glyph_transform,
+                    ..props
+                };
+
+                self.fill_path(base_outline.as_ref(), props, FillRule::NonZero);
+            }
+            Glyph::Type3(s) => {
+                self.in_type3_glyph = true;
+                s.interpret(self, props.transform, glyph_transform, &props.paint);
+                self.in_type3_glyph = false;
+            }
+        }
+    }
+
+    fn stroke_glyph<'a>(
+        &mut self,
+        glyph: &Glyph<'a>,
+        props: DrawProps<'a>,
+        glyph_transform: Affine,
+        stroke_props: &StrokeProps,
+    ) {
+        match glyph {
+            Glyph::Outline(o) => {
+                let base_outline = self.cached_outline(o);
+
+                self.stroke_path(
+                    &(glyph_transform * base_outline.as_ref().clone()),
+                    props,
+                    stroke_props,
+                    true,
+                );
+            }
+            Glyph::Type3(s) => {
+                s.interpret(self, props.transform, glyph_transform, &props.paint);
+            }
+        }
+    }
+
+    fn cached_outline(&self, glyph: &beeld_interpret::font::OutlineGlyph) -> Rc<BezPath> {
+        let id = glyph.identifier().cache_key();
+
+        if let Some(path) = self.outline_cache.borrow().get(&id) {
+            return path.clone();
+        }
+
+        let path = Rc::new(glyph.outline());
+        self.outline_cache.borrow_mut().insert(id, path.clone());
+        path
+    }
+}
+
+impl<'a> Device<'a> for Renderer {
+    fn draw_image(&mut self, image: beeld_interpret::Image<'a, '_>, props: ImageDrawProps<'a>) {
+        self.apply_image_props(&props);
+        let mut transform = props.transform;
+        self.ctx.set_paint_transform(Affine::IDENTITY);
+        self.ctx.set_aliasing_threshold(Some(1));
+
+        let target_width = (transform * Point::new(image.width() as f64, 0.0))
+            .to_vec2()
+            .length()
+            .ceil() as u32;
+        let target_height = (transform * Point::new(0.0, image.height() as f64))
+            .to_vec2()
+            .length()
+            .ceil() as u32;
+
+        match image {
+            beeld_interpret::Image::Stencil(s) => {
+                s.with_stencil(
+                    |stencil, paint| {
+                        transform *= Affine::scale_non_uniform(
+                            stencil.scale_factors.0 as f64,
+                            stencil.scale_factors.1 as f64,
+                        );
+
+                        match paint {
+                            Paint::Color(c) => {
+                                let color = c.to_rgba().to_rgba8();
+                                let alpha = color[3];
+
+                                let blend_mode = self.ctx.blend_mode();
+                                let push_layer =
+                                    alpha != 255 || blend_mode != peniko::BlendMode::default();
+                                self.ctx.set_transform(transform);
+                                if push_layer {
+                                    self.ctx.push_layer(
+                                        None,
+                                        Some(blend_mode),
+                                        Some(alpha as f32 / 255.0),
+                                        None,
+                                        None,
+                                    );
+                                }
+                                let old_rule = *self.ctx.fill_rule();
+                                self.ctx.set_fill_rule(Fill::NonZero);
+
+                                self.draw_image(
+                                    RenderImageData::Solid(SolidColorImage {
+                                        color: [color[0], color[1], color[2]],
+                                        width: stencil.width,
+                                        height: stencil.height,
+                                        interpolate: stencil.interpolate,
+                                    }),
+                                    Some(stencil),
+                                );
+
+                                if push_layer {
+                                    self.ctx.pop_layer();
+                                }
+
+                                self.ctx.set_fill_rule(old_rule);
+                            }
+                            Paint::Pattern(_) => {
+                                let (width, height) = (self.ctx.width(), self.ctx.height());
+                                let stencil_rect = Rect::new(
+                                    0.0,
+                                    0.0,
+                                    stencil.width as f64,
+                                    stencil.height as f64,
+                                );
+                                let mask_pix = {
+                                    let rgb_bytes = ImageData::Rgb(RgbData {
+                                        data: vec![
+                                            255;
+                                            stencil.width as usize
+                                                * stencil.height as usize
+                                                * 3
+                                        ],
+                                        width: stencil.width,
+                                        height: stencil.height,
+                                        interpolate: stencil.interpolate,
+                                        scale_factors: stencil.scale_factors,
+                                    });
+                                    let mut sub_renderer = Self {
+                                        ctx: RenderContext::new_with(
+                                            width,
+                                            height,
+                                            derive_settings(self.ctx.render_settings()),
+                                        ),
+                                        inside_pattern: false,
+                                        soft_mask_cache: FxHashMap::default(),
+                                        outline_cache: self.outline_cache.clone(),
+                                        in_type3_glyph: false,
+                                        scaler: self.scaler,
+                                    };
+                                    let mut sub_pix = Pixmap::new(width, height);
+                                    sub_renderer.ctx.set_transform(transform);
+                                    sub_renderer.draw_image(rgb_bytes, Some(stencil));
+                                    sub_renderer.ctx.flush();
+                                    let mut resources = vello_cpu::Resources::default();
+                                    sub_renderer.ctx.render(&mut sub_pix, &mut resources);
+                                    sub_pix
+                                };
+
+                                self.ctx.push_layer(
+                                    None,
+                                    Some(self.ctx.blend_mode()),
+                                    None,
+                                    Some(Mask::new_luminance(&mask_pix)),
+                                    None,
+                                );
+                                self.ctx.set_transform(transform);
+
+                                let clip_path = self.set_paint(paint, || stencil_rect, false);
+                                if let Some(clip_path) = clip_path.as_ref() {
+                                    self.push_clip_path_inner(clip_path, FillRule::NonZero);
+                                }
+                                self.ctx.fill_rect(&stencil_rect);
+                                if clip_path.is_some() {
+                                    self.ctx.pop_clip_path();
+                                }
+
+                                self.ctx.pop_layer();
+                            }
+                        };
+                    },
+                    Some((target_width, target_height)),
+                );
+            }
+            beeld_interpret::Image::Raster(r) => {
+                r.with_rgba(
+                    |image, alpha| {
+                        let (sx, sy) = image.scale_factors();
+                        transform *= Affine::scale_non_uniform(sx as f64, sy as f64);
+                        self.ctx.set_transform(transform);
+                        self.draw_image(image, alpha);
+                    },
+                    Some((target_width, target_height)),
+                );
+            }
+        }
+
+        self.ctx.set_aliasing_threshold(None);
+    }
+
+    fn push_clip_path(&mut self, clip_path: &ClipPath) {
+        self.push_clip_path_inner(&clip_path.path, clip_path.fill);
+    }
+
+    fn push_clip_rect(&mut self, rect: &Rect) {
+        self.push_clip_path_inner(&rect.to_path(0.1), FillRule::NonZero);
+    }
+
+    fn push_transparency_group(
+        &mut self,
+        opacity: f32,
+        mask: Option<SoftMask<'_>>,
+        blend_mode: BlendMode,
+    ) {
+        let settings = *self.ctx.render_settings();
+        self.ctx.push_layer(
+            None,
+            Some(convert_blend_mode(blend_mode)),
+            Some(opacity),
+            // TODO: Deduplicate
+            mask.map(|m| {
+                let width = self.ctx.width();
+                let height = self.ctx.height();
+
+                self.soft_mask_cache
+                    .entry(m.cache_key())
+                    .or_insert_with(|| draw_soft_mask(&m, settings, width, height))
+                    .clone()
+            }),
+            None,
+        );
+    }
+
+    fn pop_clip(&mut self) {
+        self.ctx.pop_clip_path();
+    }
+
+    fn pop_transparency_group(&mut self) {
+        self.ctx.pop_layer();
+    }
+
+    fn draw_path(&mut self, path: &BezPath, props: DrawProps<'a>, draw_mode: &DrawMode) {
+        match draw_mode {
+            DrawMode::Fill(f) => {
+                Self::fill_path(self, path, props, *f);
+            }
+            DrawMode::Stroke(s) => {
+                Self::stroke_path(self, path, props, s, false);
+            }
+            DrawMode::FillAndStroke(f, s) => {
+                Self::fill_path(self, path, props.clone(), *f);
+                Self::stroke_path(self, path, props, s, false);
+            }
+            DrawMode::Invisible => {}
+        }
+    }
+
+    fn draw_rect(&mut self, rect: &Rect, props: DrawProps<'a>, draw_mode: &DrawMode) {
+        match draw_mode {
+            DrawMode::Fill(fill_rule) => {
+                self.ctx.set_fill_rule(convert_fill_rule(*fill_rule));
+                self.apply_draw_props(&props);
+
+                let clip_path = self.set_paint(&props.paint, || *rect, false);
+                if let Some(clip_path) = clip_path.as_ref() {
+                    self.push_clip_path_inner(clip_path, *fill_rule);
+                }
+
+                self.ctx.fill_rect(rect);
+
+                if clip_path.is_some() {
+                    self.ctx.pop_clip_path();
+                }
+            }
+            DrawMode::Stroke(s) => {
+                let path = rect.to_path(0.1);
+                Self::stroke_path(self, &path, props, s, false);
+            }
+            DrawMode::FillAndStroke(fill_rule, stroke_props) => {
+                self.draw_rect(rect, props.clone(), &DrawMode::Fill(*fill_rule));
+                let path = rect.to_path(0.1);
+                Self::stroke_path(self, &path, props, stroke_props, false);
+            }
+            DrawMode::Invisible => {}
+        }
+    }
+
+    fn draw_glyph(
+        &mut self,
+        glyph: &Glyph<'a>,
+        glyph_transform: Affine,
+        props: DrawProps<'a>,
+        draw_mode: &DrawMode,
+    ) {
+        match draw_mode {
+            DrawMode::Fill(_) => {
+                Self::fill_glyph(self, glyph, props, glyph_transform);
+            }
+            DrawMode::Stroke(s) => {
+                Self::stroke_glyph(self, glyph, props, glyph_transform, s);
+            }
+            DrawMode::FillAndStroke(_, s) => {
+                Self::fill_glyph(self, glyph, props.clone(), glyph_transform);
+                Self::stroke_glyph(self, glyph, props, glyph_transform, s);
+            }
+            DrawMode::Invisible => {}
+        }
+    }
+}
+
+// TODO: Deduplicate with beeld-svg?
+fn render_shading_texture(
+    path_bbox: Rect,
+    shading_pattern: &EncodedShadingPattern,
+) -> (Vec<PremulRgba8>, u32, u32, Affine, bool) {
+    let base_width = (path_bbox.width() as f32).max(1.0);
+    let base_height = (path_bbox.height() as f32).max(1.0);
+
+    let width = (base_width).ceil() as u32;
+    let height = (base_height).ceil() as u32;
+
+    let (x_advance, y_advance) = x_y_advances(&shading_pattern.base_transform);
+
+    let mut buf = vec![PremulRgba8::from_u32(0); width as usize * height as usize];
+    let mut start_point = shading_pattern.base_transform
+        * Affine::translate((0.5, 0.5))
+        * Point::new(path_bbox.x0, path_bbox.y0);
+    let mut may_have_transparency = false;
+
+    for row in buf.chunks_exact_mut(width as usize) {
+        let mut point = start_point;
+
+        for pixel in row {
+            let sample = shading_pattern.sample(point);
+            *pixel = AlphaColor::<Srgb>::new(sample).premultiply().to_rgba8();
+            may_have_transparency |= pixel.a != 255;
+
+            point += x_advance;
+        }
+
+        start_point += y_advance;
+    }
+
+    (
+        buf,
+        width,
+        height,
+        Affine::translate((path_bbox.x0, path_bbox.y0)),
+        may_have_transparency,
+    )
+}
+
+fn draw_soft_mask(mask: &SoftMask<'_>, settings: RenderSettings, width: u16, height: u16) -> Mask {
+    let mut renderer = Renderer {
+        ctx: RenderContext::new_with(width, height, derive_settings(&settings)),
+        inside_pattern: false,
+        soft_mask_cache: FxHashMap::default(),
+        outline_cache: Rc::new(std::cell::RefCell::new(FxHashMap::default())),
+        in_type3_glyph: false,
+        scaler: Scaler::new(ResamplingFunction::CatmullRom),
+    };
+
+    let bg_color = mask.background_color().to_rgba();
+    let apply_bg = bg_color.to_rgba8() != BLACK.to_rgba8().to_u8_array();
+
+    if apply_bg {
+        renderer
+            .ctx
+            .set_paint(AlphaColor::<Srgb>::new(bg_color.components()));
+        renderer
+            .ctx
+            .fill_rect(&Rect::new(0.0, 0.0, width as f64, height as f64));
+        renderer.ctx.push_layer(None, None, None, None, None);
+    }
+
+    mask.interpret(&mut renderer);
+
+    if apply_bg {
+        renderer.ctx.pop_layer();
+    }
+
+    let mut pix = Pixmap::new(width, height);
+    renderer.ctx.flush();
+    let mut resources = vello_cpu::Resources::default();
+    renderer.ctx.render(&mut pix, &mut resources);
+
+    let mut rendered_mask = match mask.mask_type() {
+        MaskType::Luminosity => Mask::new_luminance(&pix),
+        MaskType::Alpha => Mask::new_alpha(&pix),
+    };
+
+    if let Some(transfer_function) = mask.transfer_function() {
+        let mut map = Vec::new();
+
+        for y in 0..rendered_mask.height() {
+            for x in 0..rendered_mask.width() {
+                map.push(
+                    (transfer_function.apply(rendered_mask.sample(x, y) as f32 / 255.0) * 255.0
+                        + 0.5) as u8,
+                );
+            }
+        }
+
+        rendered_mask = Mask::from_parts(map, rendered_mask.width(), rendered_mask.height());
+    }
+
+    rendered_mask
+}
+
+pub(crate) fn max_factor(transform: &Affine) -> f32 {
+    let scale_skew_transform = {
+        let c = transform.as_coeffs();
+        Affine::new([c[0], c[1], c[2], c[3], 0.0, 0.0])
+    };
+
+    let x_advance = scale_skew_transform * Point::new(1.0, 0.0);
+    let y_advance = scale_skew_transform * Point::new(0.0, 1.0);
+
+    x_advance
+        .to_vec2()
+        .length()
+        .max(y_advance.to_vec2().length()) as f32
+}
+
+pub(crate) fn x_y_advances(transform: &Affine) -> (Vec2, Vec2) {
+    let scale_skew_transform = {
+        let c = transform.as_coeffs();
+        Affine::new([c[0], c[1], c[2], c[3], 0.0, 0.0])
+    };
+
+    let x_advance = scale_skew_transform * Point::new(1.0, 0.0);
+    let y_advance = scale_skew_transform * Point::new(0.0, 1.0);
+
+    (
+        Vec2::new(x_advance.x, x_advance.y),
+        Vec2::new(y_advance.x, y_advance.y),
+    )
+}
+
+fn convert_fill_rule(fill_rule: FillRule) -> Fill {
+    match fill_rule {
+        FillRule::NonZero => Fill::NonZero,
+        FillRule::EvenOdd => Fill::EvenOdd,
+    }
+}
+
+fn convert_blend_mode(blend_mode: BlendMode) -> peniko::BlendMode {
+    let mix = match blend_mode {
+        BlendMode::Normal => Mix::Normal,
+        BlendMode::Multiply => Mix::Multiply,
+        BlendMode::Screen => Mix::Screen,
+        BlendMode::Overlay => Mix::Overlay,
+        BlendMode::Darken => Mix::Darken,
+        BlendMode::Lighten => Mix::Lighten,
+        BlendMode::ColorDodge => Mix::ColorDodge,
+        BlendMode::ColorBurn => Mix::ColorBurn,
+        BlendMode::HardLight => Mix::HardLight,
+        BlendMode::SoftLight => Mix::SoftLight,
+        BlendMode::Difference => Mix::Difference,
+        BlendMode::Exclusion => Mix::Exclusion,
+        BlendMode::Hue => Mix::Hue,
+        BlendMode::Saturation => Mix::Saturation,
+        BlendMode::Color => Mix::Color,
+        BlendMode::Luminosity => Mix::Luminosity,
+    };
+
+    peniko::BlendMode::new(mix, Compose::SrcOver)
+}

@@ -41,12 +41,12 @@ jobs:
         
       - name: Build WASM module
         run: |
-          cd hayro-demo
+          cd beeld-demo
           wasm-pack build --target web --out-dir www
           
       - name: Prepare deployment
         run: |
-          cd hayro-demo
+          cd beeld-demo
           # Create deployment directory
           mkdir -p dist
           
@@ -56,8 +56,8 @@ jobs:
           cp www/index.js dist/
           
           # Copy generated WASM files
-          cp www/hayro_demo_bg.wasm dist/
-          cp www/hayro_demo.js dist/
+          cp www/beeld_demo_bg.wasm dist/
+          cp www/beeld_demo.js dist/
           
       - name: Setup Pages
         uses: actions/configure-pages@v4
@@ -65,7 +65,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: 'hayro-demo/dist'
+          path: 'beeld-demo/dist'
 
   deploy:
     environment:

@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Beeld PDF Demo</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div id="app">
+        <div id="file-selector">
+            <div id="drop-zone">
+                <div class="drop-content">
+                    <div class="drop-icon">📄</div>
+                    <p>Drop PDF here or click to select</p>
+                </div>
+                <input type="file" id="file-input" accept=".pdf" style="display: none;">
+            </div>
+        </div>
+        
+        <div id="viewer" style="display: none;">
+            <canvas id="pdf-canvas"></canvas>
+            
+            <div id="controls">
+                <button id="prev-page" title="Previous page">← Previous</button>
+                <span id="page-info">1 / 1</span>
+                <input type="number" id="page-input" min="1" title="Go to page">
+                <button id="next-page" title="Next page">Next →</button>
+            </div>
+            
+            <div id="drop-overlay" style="display: none;">
+                <div class="drop-overlay-content">
+                    <div class="drop-icon">📄</div>
+                    <p>Drop new PDF here</p>
+                </div>
+            </div>
+        </div>
+        
+        <div id="log-window">
+            <div id="log-header">
+                <span>Logs</span>
+                <button id="clear-logs" title="Clear logs">Clear</button>
+            </div>
+            <div id="log-content"></div>
+        </div>
+    </div>
+    <script type="module" src="index.js"></script>
+</body>
+</html>

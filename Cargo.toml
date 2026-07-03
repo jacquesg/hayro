@@ -1,41 +1,42 @@
 [workspace]
 resolver = "2"
 members = [
-    "hayro-interpret",
-    "hayro",
-    "hayro-bench",
-    "hayro-syntax",
-    "hayro-demo",
-    "hayro-tests",
-    "hayro-write",
-    "hayro-svg",
-    "hayro-jpeg2000",
-    "hayro-jbig2",
-    "hayro-ccitt",
-    "hayro-fuzz",
-    "hayro-postscript",
-    "hayro-cmap"
+    "beeld-interpret",
+    "beeld",
+    "beeld-bench",
+    "beeld-syntax",
+    "beeld-demo",
+    "beeld-tests",
+    "beeld-write",
+    "beeld-svg",
+    "beeld-jpeg2000",
+    "beeld-jbig2",
+    "beeld-ccitt",
+    "beeld-fuzz",
+    "beeld-postscript",
+    "beeld-cmap"
 ]
 
 [workspace.package]
 authors = ["Laurenz Stampfl <laurenz.stampfl@gmail.com>"]
 edition = "2024"
 rust-version = "1.92" # also change in ci.yml
-repository = "https://github.com/LaurenzV/hayro"
+repository = "https://git.bloudraad.io/bloudraad/beeld"
 readme = "README.md"
-license = "Apache-2.0 OR MIT"
+license = "LicenseRef-Proprietary"
+publish = false
 
 [workspace.dependencies]
-hayro = { path = "hayro", version = "0.7.0", default-features = false }
-hayro-ccitt = { path = "hayro-ccitt", version = "0.3.0", default-features = false }
-hayro-interpret = { path = "hayro-interpret", version = "0.7.0", default-features = false }
-hayro-jpeg2000 = { path = "hayro-jpeg2000", version = "0.4.0", default-features = false }
-hayro-jbig2 = { path = "hayro-jbig2", version = "0.3.0", default-features = false }
-hayro-syntax = { path = "hayro-syntax", version = "0.7.2", default-features = false }
-hayro-svg = { path = "hayro-svg", version = "0.7.0", default-features = false }
-hayro-write = { path = "hayro-write", version = "0.7.0", default-features = false }
-hayro-postscript = { path = "hayro-postscript", version = "0.1.0", default-features = false }
-hayro-cmap = { path = "hayro-cmap", version = "0.1.0", default-features = false }
+beeld = { path = "beeld", version = "0.7.0", default-features = false }
+beeld-ccitt = { path = "beeld-ccitt", version = "0.3.0", default-features = false }
+beeld-interpret = { path = "beeld-interpret", version = "0.7.0", default-features = false }
+beeld-jpeg2000 = { path = "beeld-jpeg2000", version = "0.4.0", default-features = false }
+beeld-jbig2 = { path = "beeld-jbig2", version = "0.3.0", default-features = false }
+beeld-syntax = { path = "beeld-syntax", version = "0.7.2", default-features = false }
+beeld-svg = { path = "beeld-svg", version = "0.7.0", default-features = false }
+beeld-write = { path = "beeld-write", version = "0.7.0", default-features = false }
+beeld-postscript = { path = "beeld-postscript", version = "0.1.0", default-features = false }
+beeld-cmap = { path = "beeld-cmap", version = "0.1.0", default-features = false }
 
 bitflags = { version = "2.10" }
 bytemuck = { version = "1" }

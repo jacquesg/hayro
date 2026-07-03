@@ -1,0 +1,14 @@
+node_modules
+*.wasm
+
+www/beeld_demo_bg.wasm
+www/beeld_demo_bg.wasm.d.ts
+www/beeld_demo.js
+www/beeld_demo.d.ts
+www/package.json
+
+dist/
+target/
+
+.DS_Store
+Thumbs.db

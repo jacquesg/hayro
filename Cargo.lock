@@ -95,6 +95,185 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "beeld"
+version = "0.7.0"
+dependencies = [
+ "beeld-interpret",
+ "bytemuck",
+ "image 0.25.10",
+ "kurbo",
+ "log",
+ "pic-scale",
+ "rustc-hash",
+ "vello_cpu",
+]
+
+[[package]]
+name = "beeld-bench"
+version = "0.1.0"
+dependencies = [
+ "beeld",
+ "beeld-jpeg2000",
+ "beeld-syntax",
+ "image 0.25.10",
+ "pdfium-render",
+ "walkdir",
+]
+
+[[package]]
+name = "beeld-ccitt"
+version = "0.3.0"
+
+[[package]]
+name = "beeld-cmap"
+version = "0.1.0"
+dependencies = [
+ "beeld-postscript",
+ "brotli",
+]
+
+[[package]]
+name = "beeld-demo"
+version = "0.1.0"
+dependencies = [
+ "beeld",
+ "bytemuck",
+ "console_error_panic_hook",
+ "js-sys",
+ "log",
+ "vello_cpu",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
+name = "beeld-fuzz"
+version = "0.0.0"
+dependencies = [
+ "beeld-ccitt",
+ "beeld-jbig2",
+ "beeld-jpeg2000",
+ "image 0.25.10",
+ "libfuzzer-sys",
+]
+
+[[package]]
+name = "beeld-interpret"
+version = "0.7.0"
+dependencies = [
+ "beeld-cmap",
+ "beeld-syntax",
+ "bitflags 2.11.0",
+ "image 0.25.10",
+ "kurbo",
+ "log",
+ "moxcms",
+ "phf",
+ "rustc-hash",
+ "siphasher",
+ "skrifa",
+ "smallvec",
+ "yoke",
+]
+
+[[package]]
+name = "beeld-jbig2"
+version = "0.3.0"
+dependencies = [
+ "beeld-ccitt",
+ "criterion",
+ "fearless_simd",
+ "image 0.25.10",
+ "indicatif",
+ "rayon",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "beeld-jpeg2000"
+version = "0.4.0"
+dependencies = [
+ "criterion",
+ "fearless_simd",
+ "image 0.25.10",
+ "indicatif",
+ "log",
+ "moxcms",
+ "rayon",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "beeld-postscript"
+version = "0.1.0"
+
+[[package]]
+name = "beeld-svg"
+version = "0.7.0"
+dependencies = [
+ "base64",
+ "beeld-interpret",
+ "image 0.25.10",
+ "kurbo",
+ "log",
+ "rustc-hash",
+ "siphasher",
+ "xmlwriter",
+]
+
+[[package]]
+name = "beeld-syntax"
+version = "0.7.2"
+dependencies = [
+ "aes",
+ "beeld-ccitt",
+ "beeld-jbig2",
+ "beeld-jpeg2000",
+ "cbc",
+ "flate2",
+ "log",
+ "md5",
+ "memchr",
+ "rustc-hash",
+ "sha2",
+ "smallvec",
+ "zune-jpeg",
+]
+
+[[package]]
+name = "beeld-tests"
+version = "0.1.0"
+dependencies = [
+ "beeld",
+ "beeld-cmap",
+ "beeld-jbig2",
+ "beeld-jpeg2000",
+ "beeld-svg",
+ "beeld-syntax",
+ "beeld-write",
+ "image 0.25.10",
+ "memchr",
+ "pdf-writer",
+ "rayon",
+ "resvg",
+ "sitro",
+ "walkdir",
+]
+
+[[package]]
+name = "beeld-write"
+version = "0.7.0"
+dependencies = [
+ "beeld-syntax",
+ "flate2",
+ "log",
+ "pdf-writer",
+ "rustc-hash",
+]
+
+[[package]]
 name = "bit_field"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -710,185 +889,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
  "foldhash",
-]
-
-[[package]]
-name = "hayro"
-version = "0.7.0"
-dependencies = [
- "bytemuck",
- "hayro-interpret",
- "image 0.25.10",
- "kurbo",
- "log",
- "pic-scale",
- "rustc-hash",
- "vello_cpu",
-]
-
-[[package]]
-name = "hayro-bench"
-version = "0.1.0"
-dependencies = [
- "hayro",
- "hayro-jpeg2000",
- "hayro-syntax",
- "image 0.25.10",
- "pdfium-render",
- "walkdir",
-]
-
-[[package]]
-name = "hayro-ccitt"
-version = "0.3.0"
-
-[[package]]
-name = "hayro-cmap"
-version = "0.1.0"
-dependencies = [
- "brotli",
- "hayro-postscript",
-]
-
-[[package]]
-name = "hayro-demo"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "console_error_panic_hook",
- "hayro",
- "js-sys",
- "log",
- "vello_cpu",
- "wasm-bindgen",
- "web-sys",
-]
-
-[[package]]
-name = "hayro-fuzz"
-version = "0.0.0"
-dependencies = [
- "hayro-ccitt",
- "hayro-jbig2",
- "hayro-jpeg2000",
- "image 0.25.10",
- "libfuzzer-sys",
-]
-
-[[package]]
-name = "hayro-interpret"
-version = "0.7.0"
-dependencies = [
- "bitflags 2.11.0",
- "hayro-cmap",
- "hayro-syntax",
- "image 0.25.10",
- "kurbo",
- "log",
- "moxcms",
- "phf",
- "rustc-hash",
- "siphasher",
- "skrifa",
- "smallvec",
- "yoke",
-]
-
-[[package]]
-name = "hayro-jbig2"
-version = "0.3.0"
-dependencies = [
- "criterion",
- "fearless_simd",
- "hayro-ccitt",
- "image 0.25.10",
- "indicatif",
- "rayon",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "hayro-jpeg2000"
-version = "0.4.0"
-dependencies = [
- "criterion",
- "fearless_simd",
- "image 0.25.10",
- "indicatif",
- "log",
- "moxcms",
- "rayon",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "hayro-postscript"
-version = "0.1.0"
-
-[[package]]
-name = "hayro-svg"
-version = "0.7.0"
-dependencies = [
- "base64",
- "hayro-interpret",
- "image 0.25.10",
- "kurbo",
- "log",
- "rustc-hash",
- "siphasher",
- "xmlwriter",
-]
-
-[[package]]
-name = "hayro-syntax"
-version = "0.7.2"
-dependencies = [
- "aes",
- "cbc",
- "flate2",
- "hayro-ccitt",
- "hayro-jbig2",
- "hayro-jpeg2000",
- "log",
- "md5",
- "memchr",
- "rustc-hash",
- "sha2",
- "smallvec",
- "zune-jpeg",
-]
-
-[[package]]
-name = "hayro-tests"
-version = "0.1.0"
-dependencies = [
- "hayro",
- "hayro-cmap",
- "hayro-jbig2",
- "hayro-jpeg2000",
- "hayro-svg",
- "hayro-syntax",
- "hayro-write",
- "image 0.25.10",
- "memchr",
- "pdf-writer",
- "rayon",
- "resvg",
- "sitro",
- "walkdir",
-]
-
-[[package]]
-name = "hayro-write"
-version = "0.7.0"
-dependencies = [
- "flate2",
- "hayro-syntax",
- "log",
- "pdf-writer",
- "rustc-hash",
 ]
 
 [[package]]

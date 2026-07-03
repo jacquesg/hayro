@@ -1,0 +1,33 @@
+[package]
+name = "beeld-svg"
+version = "0.7.0"
+description = "Converting PDF pages into SVG files."
+authors = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+readme = "README.md"
+license = { workspace = true }
+publish.workspace = true
+
+[dependencies]
+beeld-interpret = { workspace = true }
+xmlwriter = { workspace = true }
+siphasher = { workspace = true }
+kurbo = { workspace = true }
+image = { workspace = true, features = ["png"] }
+base64 = { workspace = true }
+rustc-hash = { workspace = true }
+
+[features]
+default = ["embed-fonts", "embed-cmaps"]
+embed-fonts = ["beeld-interpret/embed-fonts"]
+# Embed the 61 predefined cmaps into the binary. Adds about ~250KB of brotli-encoded data.
+embed-cmaps = ["beeld-interpret/embed-cmaps"]
+logging = ["beeld-interpret/logging"]
+
+[dev-dependencies]
+log = { workspace = true }
+
+[lints]
+workspace = true

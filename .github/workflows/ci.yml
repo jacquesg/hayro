@@ -17,10 +17,10 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-hack
-      - run: RUSTFLAGS="-D warnings" cargo clippy --workspace --exclude hayro-demo --exclude hayro-bench --tests --examples
+      - run: RUSTFLAGS="-D warnings" cargo clippy --workspace --exclude beeld-demo --exclude beeld-bench --tests --examples
       - run: cargo fmt --check --all
-      - run: RUSTFLAGS="-D warnings" cargo doc --workspace --exclude hayro-demo --exclude hayro-bench --no-deps
-      - run: RUSTFLAGS="-D warnings" cargo hack check --each-feature --workspace --exclude hayro-demo --exclude hayro-bench
+      - run: RUSTFLAGS="-D warnings" cargo doc --workspace --exclude beeld-demo --exclude beeld-bench --no-deps
+      - run: RUSTFLAGS="-D warnings" cargo hack check --each-feature --workspace --exclude beeld-demo --exclude beeld-bench
 
   min-version:
     name: Check minimum Rust version
@@ -40,10 +40,10 @@ jobs:
         with:
           targets: thumbv6m-none-eabi
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check -p hayro-ccitt --target thumbv6m-none-eabi
-      - run: cargo check -p hayro-jbig2 --no-default-features --target thumbv6m-none-eabi
-      - run: cargo check -p hayro-jpeg2000 --no-default-features --target thumbv6m-none-eabi
-      - run: cargo check -p hayro-syntax --no-default-features --target thumbv6m-none-eabi
+      - run: cargo check -p beeld-ccitt --target thumbv6m-none-eabi
+      - run: cargo check -p beeld-jbig2 --no-default-features --target thumbv6m-none-eabi
+      - run: cargo check -p beeld-jpeg2000 --no-default-features --target thumbv6m-none-eabi
+      - run: cargo check -p beeld-syntax --no-default-features --target thumbv6m-none-eabi
     
 
   load_tests:
@@ -53,4 +53,4 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.92.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p hayro-tests -- "load::"
+      - run: cargo test -p beeld-tests -- "load::"

@@ -1,0 +1,40 @@
+[package]
+name = "beeld-tests"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme.workspace = true
+license.workspace = true
+publish = false
+autotests = false
+
+[[bin]]
+name = "experiment"
+path = "src/experiment.rs"
+
+[[test]]
+name = "tests"
+path = "tests/mod.rs"
+
+[dependencies]
+beeld = { workspace = true, features = ["embed-cmaps"] }
+beeld-cmap = { workspace = true }
+beeld-write = { workspace = true }
+beeld-svg = { workspace = true }
+beeld-syntax = { workspace = true, features = ["std", "unsafe"] }
+beeld-jbig2 = { workspace = true }
+beeld-jpeg2000 = { workspace = true, features = ["image"] }
+pdf-writer = { workspace = true }
+image = { workspace = true, default-features = false}
+resvg = { workspace = true }
+walkdir = "2"
+rayon = "1.11"
+memchr = { version = "2.7.6"}
+
+
+[dev-dependencies]
+beeld-syntax = { workspace = true }
+image = {  workspace = true }
+sitro = { workspace = true }
