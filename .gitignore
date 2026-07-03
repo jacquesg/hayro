@@ -1,3 +1,7 @@
 target
 .DS_STORE
 rendered_*.png
+
+# Local env files carrying secrets (e.g. WP_TOKEN for the Woodpecker CI API).
+.env.local
+.env.*.local
