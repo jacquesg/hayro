@@ -449,7 +449,7 @@ impl<'b, 'a> Instruction<'b, 'a> {
     ///
     /// The buffer is the decoded content stream, not the raw PDF source
     /// bytes. To recover a PDF-file position, combine with
-    /// [`crate::object::Stream::body_range`] and knowledge of the
+    /// `Stream::body_range` (with the `inspect` feature) and knowledge of the
     /// stream's filter chain — reversing filters is not generally
     /// possible, and this API does not attempt it.
     pub fn offset(&self) -> usize {

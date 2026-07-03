@@ -142,9 +142,7 @@ mod tests {
         pdf.extend_from_slice(b"%PDF-1.7\n");
 
         let off1 = pdf.len();
-        pdf.extend_from_slice(
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Names 4 0 R >>\nendobj\n",
-        );
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Names 4 0 R >>\nendobj\n");
         let off2 = pdf.len();
         pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
         // Dests tree (flat).
@@ -187,9 +185,7 @@ mod tests {
         let mut pdf: Vec<u8> = Vec::new();
         pdf.extend_from_slice(b"%PDF-1.7\n");
         let off1 = pdf.len();
-        pdf.extend_from_slice(
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Names 3 0 R >>\nendobj\n",
-        );
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Names 3 0 R >>\nendobj\n");
         let off2 = pdf.len();
         pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
         let off3 = pdf.len();
@@ -248,7 +244,10 @@ mod tests {
         let collected: Vec<(Vec<u8>, Object<'_>)> = tree.iter().collect();
         assert_eq!(collected.len(), 3);
         let keys: Vec<_> = collected.iter().map(|(k, _)| k.clone()).collect();
-        assert_eq!(keys, alloc::vec![b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()]);
+        assert_eq!(
+            keys,
+            alloc::vec![b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()]
+        );
     }
 
     #[test]

@@ -175,9 +175,7 @@ impl<'a> Stream<'a> {
         let body_start_addr = self.data.as_ptr() as usize;
         let body_end_addr = body_start_addr.wrapping_add(self.data.len());
 
-        if body_start_addr < pdf_start
-            || body_end_addr > pdf_end
-            || body_end_addr < body_start_addr
+        if body_start_addr < pdf_start || body_end_addr > pdf_end || body_end_addr < body_start_addr
         {
             return None;
         }
@@ -205,7 +203,7 @@ impl<'a> Stream<'a> {
     ///
     /// Returns `None` when any real filter is present (`/FlateDecode`,
     /// `/LZWDecode`, `/DCTDecode`, etc.) — reversing such filters is
-    /// not generally possible and hayro does not attempt it. Also
+    /// not generally possible and beeld does not attempt it. Also
     /// returns `None` whenever [`body_range`](Self::body_range) would.
     ///
     /// Requires the `inspect` feature.
@@ -264,17 +262,16 @@ impl<'a> Stream<'a> {
 
         // Identify the EOL immediately preceding the body.
         let before_body = pdf_data.get(..range.start)?;
-        let (eol_size, stream_keyword_eol_canonical) =
-            if before_body.ends_with(b"\r\n") {
-                (2_usize, true)
-            } else if before_body.ends_with(b"\n") {
-                (1_usize, true)
-            } else if before_body.ends_with(b"\r") {
-                // CR alone is not permitted per §7.3.8.1.
-                (1_usize, false)
-            } else {
-                return None;
-            };
+        let (eol_size, stream_keyword_eol_canonical) = if before_body.ends_with(b"\r\n") {
+            (2_usize, true)
+        } else if before_body.ends_with(b"\n") {
+            (1_usize, true)
+        } else if before_body.ends_with(b"\r") {
+            // CR alone is not permitted per §7.3.8.1.
+            (1_usize, false)
+        } else {
+            return None;
+        };
 
         let stream_keyword_end = range.start.checked_sub(eol_size)?;
         let stream_keyword_offset = stream_keyword_end.checked_sub(b"stream".len())?;
@@ -292,9 +289,7 @@ impl<'a> Stream<'a> {
             }
         }
         let endstream_end = endstream_keyword_offset + b"endstream".len();
-        if pdf_data.get(endstream_keyword_offset..endstream_end)
-            != Some(b"endstream".as_slice())
-        {
+        if pdf_data.get(endstream_keyword_offset..endstream_end) != Some(b"endstream".as_slice()) {
             return None;
         }
 
@@ -602,7 +597,12 @@ mod tests {
             pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
             let off3 = pdf.len();
             pdf.extend_from_slice(
-                format!("3 0 obj\n<< /Length {}{} >>\nstream", body.len(), dict_extra).as_bytes(),
+                format!(
+                    "3 0 obj\n<< /Length {}{} >>\nstream",
+                    body.len(),
+                    dict_extra
+                )
+                .as_bytes(),
             );
             pdf.extend_from_slice(eol);
             pdf.extend_from_slice(body);
@@ -778,9 +778,8 @@ mod tests {
         #[test]
         fn tier_b_flate_fixture_body_range() {
             // andler-optimal-lot-size has Flate-compressed streams.
-            let bytes: &[u8] = include_bytes!(
-                "../../../hayro-tests/pdfs/custom/andler-optimal-lot-size.pdf"
-            );
+            let bytes: &[u8] =
+                include_bytes!("../../../beeld-tests/pdfs/custom/andler-optimal-lot-size.pdf");
             let pdf = Pdf::new(bytes.to_vec()).expect("fixture loads");
             let stream = first_stream(&pdf).expect("fixture has at least one stream");
             let range = stream.body_range().expect("body range");

@@ -599,14 +599,11 @@ impl XRef {
     ///
     /// Malformed cases (e.g. a compressed entry whose host is itself
     /// compressed or free — illegal per ISO 32000-1 §7.5.7) also return
-    /// `None`; hayro does not attempt recovery.
+    /// `None`; beeld does not attempt recovery.
     ///
     /// Requires the `inspect` feature.
     #[cfg(feature = "inspect")]
-    pub fn indirect_layout(
-        &self,
-        id: ObjectIdentifier,
-    ) -> Option<crate::layout::LayoutKind> {
+    pub fn indirect_layout(&self, id: ObjectIdentifier) -> Option<crate::layout::LayoutKind> {
         use crate::layout::{LayoutKind, scan_indirect_layout};
 
         let repr = match &self.0 {
@@ -645,8 +642,7 @@ impl XRef {
     /// This is the trailer's `/Size` value when present, falling back to
     /// the highest observed object number plus one.
     pub fn size(&self) -> i32 {
-        let from_trailer: Option<i32> =
-            self.trailer().and_then(|t| t.get::<i32>(SIZE));
+        let from_trailer: Option<i32> = self.trailer().and_then(|t| t.get::<i32>(SIZE));
         let from_map: i32 = match &self.0 {
             Inner::Dummy => 0,
             Inner::Some(r) => r
@@ -905,10 +901,7 @@ impl XRef {
                             if object.id() == &id {
                                 return Some(object.get());
                             }
-                        } else if r
-                            .skip::<IndirectObject<Object<'_>>>(false)
-                            .is_some()
-                        {
+                        } else if r.skip::<IndirectObject<Object<'_>>>(false).is_some() {
                             // Valid object, wrong type - a clean miss.
                             return None;
                         }
@@ -1547,7 +1540,9 @@ fn populate_from_xref_table<'a>(
             if entry.used {
                 insert_map.insert(
                     ObjectIdentifier::new(obj_number as i32, entry.gen_number),
-                    EntryType::Normal { offset: entry.offset },
+                    EntryType::Normal {
+                        offset: entry.offset,
+                    },
                 );
             } else {
                 // Free entry: the "offset" column is the next free object
@@ -1994,13 +1989,9 @@ fn scan_table_section(data: &[u8], pos: usize) -> Option<(XRefSection, Option<us
     let trailer_dict = reader.read_with_context::<Dict<'_>>(&ReaderContext::dummy())?;
     let trailer_end = trailer_start + trailer_dict.data().len();
 
-    let prev = trailer_dict.get::<i32>(PREV).and_then(|p| {
-        if p >= 0 {
-            Some(p as usize)
-        } else {
-            None
-        }
-    });
+    let prev = trailer_dict
+        .get::<i32>(PREV)
+        .and_then(|p| if p >= 0 { Some(p as usize) } else { None });
 
     Some((
         XRefSection {
@@ -2026,13 +2017,10 @@ fn scan_stream_section(data: &[u8], pos: usize) -> Option<(XRefSection, Option<u
     let stream = reader
         .read_with_context::<IndirectObject<Stream<'_>>>(&ReaderContext::dummy())?
         .get();
-    let prev = stream.dict().get::<i32>(PREV).and_then(|p| {
-        if p >= 0 {
-            Some(p as usize)
-        } else {
-            None
-        }
-    });
+    let prev = stream
+        .dict()
+        .get::<i32>(PREV)
+        .and_then(|p| if p >= 0 { Some(p as usize) } else { None });
 
     Some((
         XRefSection {
@@ -2183,7 +2171,7 @@ mod tests {
 
     #[test]
     fn encryption_dict_present_for_aes_128_fixture() {
-        let bytes: &[u8] = include_bytes!("../../hayro-tests/pdfs/custom/encrypted_aes_128.pdf");
+        let bytes: &[u8] = include_bytes!("../../beeld-tests/pdfs/custom/encrypted_aes_128.pdf");
         let pdf = Pdf::new(bytes.to_vec()).expect("aes-128 fixture loads");
         assert!(pdf.is_encrypted());
         let enc = pdf.encryption_dict().expect("encryption dict");
@@ -2193,7 +2181,7 @@ mod tests {
 
     #[test]
     fn encryption_dict_present_for_aes_256_fixture() {
-        let bytes: &[u8] = include_bytes!("../../hayro-tests/pdfs/custom/encrypted_aes_256.pdf");
+        let bytes: &[u8] = include_bytes!("../../beeld-tests/pdfs/custom/encrypted_aes_256.pdf");
         let pdf = Pdf::new(bytes.to_vec()).expect("aes-256 fixture loads");
         assert!(pdf.is_encrypted());
         let enc = pdf.encryption_dict().expect("encryption dict");
@@ -2207,7 +2195,7 @@ mod tests {
     #[test]
     fn encryption_dict_absent_for_unencrypted_real_fixture() {
         let bytes: &[u8] =
-            include_bytes!("../../hayro-tests/pdfs/custom/andler-optimal-lot-size.pdf");
+            include_bytes!("../../beeld-tests/pdfs/custom/andler-optimal-lot-size.pdf");
         let pdf = Pdf::new(bytes.to_vec()).expect("fixture loads");
         assert!(!pdf.is_encrypted());
         assert!(pdf.encryption_dict().is_none());
@@ -2216,7 +2204,7 @@ mod tests {
     #[test]
     fn encryption_dict_present_after_password_decryption() {
         let bytes: &[u8] =
-            include_bytes!("../../hayro-tests/pdfs/custom/password_encrypted_aes_128.pdf");
+            include_bytes!("../../beeld-tests/pdfs/custom/password_encrypted_aes_128.pdf");
         let pdf = Pdf::new_with_password(bytes.to_vec(), "testpw")
             .expect("password-protected fixture decrypts");
         // /Encrypt is still present in the trailer even after successful decryption.
@@ -2230,7 +2218,7 @@ mod tests {
     fn trailer_on_real_fixture_has_size_and_root() {
         // Tier B: committed fixture.
         let bytes: &[u8] =
-            include_bytes!("../../hayro-tests/pdfs/custom/andler-optimal-lot-size.pdf");
+            include_bytes!("../../beeld-tests/pdfs/custom/andler-optimal-lot-size.pdf");
         let pdf = Pdf::new(bytes.to_vec()).expect("fixture loads");
         let trailer = pdf.trailer().expect("trailer available");
         let size: i32 = trailer.get(b"Size").expect("Size integer");
@@ -2291,7 +2279,10 @@ mod tests {
             .entry(ObjectIdentifier::new(0, 65535))
             .expect("free head present");
         match head {
-            EntryType::Free { next_free, generation } => {
+            EntryType::Free {
+                next_free,
+                generation,
+            } => {
                 assert_eq!(next_free, 3);
                 assert_eq!(generation, 65535);
             }
@@ -2382,7 +2373,7 @@ mod tests {
     #[test]
     fn sections_on_real_fixture_has_at_least_one() {
         let bytes: &[u8] =
-            include_bytes!("../../hayro-tests/pdfs/custom/andler-optimal-lot-size.pdf");
+            include_bytes!("../../beeld-tests/pdfs/custom/andler-optimal-lot-size.pdf");
         let pdf = Pdf::new(bytes.to_vec()).expect("fixture loads");
         let sections = pdf.xref().sections();
         assert!(!sections.is_empty());
@@ -2400,7 +2391,7 @@ mod tests {
     fn sections_for_xref_stream_fixture() {
         // catalog-in-objstm-aes uses a 1.5+ layout with an xref stream.
         let bytes: &[u8] =
-            include_bytes!("../../hayro-tests/pdfs/custom/catalog-in-objstm-aes.pdf");
+            include_bytes!("../../beeld-tests/pdfs/custom/catalog-in-objstm-aes.pdf");
         let pdf = Pdf::new(bytes.to_vec()).expect("fixture loads");
         let sections = pdf.xref().sections();
         assert!(!sections.is_empty());
@@ -2517,11 +2508,7 @@ mod tests {
     #[test]
     fn indirect_layout_on_dummy_xref_is_none() {
         let dummy = XRef::dummy();
-        assert!(
-            dummy
-                .indirect_layout(ObjectIdentifier::new(1, 0))
-                .is_none()
-        );
+        assert!(dummy.indirect_layout(ObjectIdentifier::new(1, 0)).is_none());
     }
 
     #[cfg(feature = "inspect")]
@@ -2530,7 +2517,7 @@ mod tests {
         use crate::layout::LayoutKind;
 
         let bytes: &[u8] =
-            include_bytes!("../../hayro-tests/pdfs/custom/catalog-in-objstm-aes.pdf");
+            include_bytes!("../../beeld-tests/pdfs/custom/catalog-in-objstm-aes.pdf");
         let pdf = Pdf::new(bytes.to_vec()).expect("fixture loads");
         let catalog_id = pdf.xref().root_id();
         let kind = pdf
@@ -2555,17 +2542,14 @@ mod tests {
     #[test]
     fn entries_on_real_fixture_matches_size() {
         let bytes: &[u8] =
-            include_bytes!("../../hayro-tests/pdfs/custom/andler-optimal-lot-size.pdf");
+            include_bytes!("../../beeld-tests/pdfs/custom/andler-optimal-lot-size.pdf");
         let pdf = Pdf::new(bytes.to_vec()).expect("fixture loads");
         let xref = pdf.xref();
         let size = xref.size();
         let count = xref.entries().len();
         // Every object number up to /Size is accounted for as either an
         // in-use entry or a free entry on the free list.
-        assert!(
-            count <= size as usize,
-            "entries ({count}) <= size ({size})"
-        );
+        assert!(count <= size as usize, "entries ({count}) <= size ({size})");
     }
 
     #[test]
@@ -2605,7 +2589,7 @@ mod tests {
     /// abort the xref build via the cycle guard. Real-world incremental
     /// updates routinely re-publish the original revision's `/XRefStm`
     /// pointer in the new trailer (e.g. signing tools that update `/Prev`
-    /// + `/XRefStm` in lockstep). The first traversal visits the stream
+    /// and `/XRefStm` in lockstep). The first traversal visits the stream
     /// offset; subsequent visits return `None` from `populate_xref_impl_inner`,
     /// and that `None` must be ignored — propagating it would force the
     /// whole `root_xref` call to fail and fall back to a heuristic scan

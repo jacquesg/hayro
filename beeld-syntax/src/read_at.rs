@@ -38,7 +38,7 @@ pub enum ReadAtError {
 impl core::fmt::Display for ReadAtError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            ReadAtError::Io => f.write_str("positioned-read source I/O error"),
+            Self::Io => f.write_str("positioned-read source I/O error"),
         }
     }
 }
@@ -92,7 +92,7 @@ pub trait ReadAt {
     /// is permitted to return. Returns the number of bytes filled, which is
     /// less than `buf.len()` only at end-of-source.
     fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, ReadAtError> {
-        let mut filled = 0usize;
+        let mut filled = 0_usize;
         while filled < buf.len() {
             match self.read_at(offset + filled as u64, &mut buf[filled..])? {
                 0 => break,
@@ -106,7 +106,7 @@ pub trait ReadAt {
     /// allocated `Vec`, truncated to the bytes actually available at
     /// end-of-source.
     fn read_range(&self, offset: u64, len: usize) -> Result<Vec<u8>, ReadAtError> {
-        let mut buf = vec![0u8; len];
+        let mut buf = vec![0_u8; len];
         let n = self.read_exact_at(offset, &mut buf)?;
         buf.truncate(n);
         Ok(buf)

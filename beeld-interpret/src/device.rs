@@ -47,8 +47,8 @@ pub trait Device<'a> {
     /// The tag is the marked content tag (e.g. b"P", b"Span"). The mcid is the
     /// marked content identifier from the properties dict, if present.
     /// `actual_text` carries the raw `/ActualText` string bytes (PDF text-string
-    /// encoding — UTF-16BE or PDFDocEncoded) from the properties dict, if present;
-    /// a recording device can use it as the text for glyphs that lack a ToUnicode
+    /// encoding — UTF-16BE or `PDFDocEncoded`) from the properties dict, if present;
+    /// a recording device can use it as the text for glyphs that lack a `ToUnicode`
     /// mapping (e.g. colour-emoji glyphs).
     fn begin_marked_content(
         &mut self,

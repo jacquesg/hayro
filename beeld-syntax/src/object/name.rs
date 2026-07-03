@@ -25,7 +25,7 @@ use smallvec::SmallVec;
 ///     caller did not give us a parent-buffer offset to record.
 ///   * synthetic names (no source span at all).
 ///   * names whose body starts at an offset ≥ `u32::MAX` (i.e. PDFs
-///     ≥ 4 GiB) — see [`Name::new_at`]. Hayro is permissive here:
+///     ≥ 4 GiB) — see [`Name::new_at`]. Beeld is permissive here:
 ///     `byte_range()` simply reports `None` rather than truncating
 ///     silently. Callers that absolutely need to byte-rewrite such
 ///     names in 4 GiB+ inputs must fall back to a string-search pass.
@@ -367,7 +367,10 @@ mod tests {
 
     #[test]
     fn name_5() {
-        assert_eq!(parse(b"/ASomewhatLongerName").deref(), b"ASomewhatLongerName");
+        assert_eq!(
+            parse(b"/ASomewhatLongerName").deref(),
+            b"ASomewhatLongerName"
+        );
     }
 
     #[test]
@@ -413,7 +416,10 @@ mod tests {
 
     #[test]
     fn name_13() {
-        assert_eq!(parse(b"/The_Key_of_F#23_Minor").deref(), b"The_Key_of_F#_Minor");
+        assert_eq!(
+            parse(b"/The_Key_of_F#23_Minor").deref(),
+            b"The_Key_of_F#_Minor"
+        );
     }
 
     #[test]
@@ -494,7 +500,7 @@ mod tests {
 
     #[test]
     fn source_for_200_byte_unescaped_name_is_permissive() {
-        // ISO 32000-1 §7.3.5 RECOMMENDS ≤ 127 encoded bytes; hayro is
+        // ISO 32000-1 §7.3.5 RECOMMENDS ≤ 127 encoded bytes; beeld is
         // permissive and does not enforce the limit.
         let mut bytes: Vec<u8> = Vec::with_capacity(201);
         bytes.push(b'/');

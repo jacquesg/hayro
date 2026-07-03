@@ -144,18 +144,12 @@ fn get_required_i64(dict: &Dict<'_>, key: &'static [u8]) -> Result<i64, Lineariz
         .ok_or(LinearizationError::InvalidType(key))
 }
 
-fn get_required_usize(
-    dict: &Dict<'_>,
-    key: &'static [u8],
-) -> Result<usize, LinearizationError> {
+fn get_required_usize(dict: &Dict<'_>, key: &'static [u8]) -> Result<usize, LinearizationError> {
     let value = get_required_i64(dict, key)?;
     usize::try_from(value).map_err(|_| LinearizationError::OffsetTooLarge(key))
 }
 
-fn get_required_i32(
-    dict: &Dict<'_>,
-    key: &'static [u8],
-) -> Result<i32, LinearizationError> {
+fn get_required_i32(dict: &Dict<'_>, key: &'static [u8]) -> Result<i32, LinearizationError> {
     let value = get_required_i64(dict, key)?;
     i32::try_from(value).map_err(|_| LinearizationError::OffsetTooLarge(key))
 }
@@ -169,9 +163,7 @@ fn parse_hint_offsets(dict: &Dict<'_>) -> Result<Option<Vec<usize>>, Linearizati
     };
     let mut out: Vec<usize> = Vec::new();
     for value in array.iter::<i64>() {
-        out.push(
-            usize::try_from(value).map_err(|_| LinearizationError::OffsetTooLarge(b"H"))?,
-        );
+        out.push(usize::try_from(value).map_err(|_| LinearizationError::OffsetTooLarge(b"H"))?);
     }
     Ok(Some(out))
 }
@@ -366,9 +358,8 @@ mod tests {
 
     #[test]
     fn tier_b_real_linearized_fixture() {
-        let bytes: &[u8] = include_bytes!(
-            "../../hayro-tests/pdfs/custom/andler-optimal-lot-size_linearized.pdf"
-        );
+        let bytes: &[u8] =
+            include_bytes!("../../beeld-tests/pdfs/custom/andler-optimal-lot-size_linearized.pdf");
         let pdf = Pdf::new(bytes.to_vec()).expect("linearized fixture loads");
         assert!(pdf.is_linearized());
         let lin = pdf.linearization().expect("parsed linearization");
@@ -380,14 +371,10 @@ mod tests {
     #[cfg(feature = "inspect")]
     #[test]
     fn first_page_trailer_for_linearized_fixture() {
-        let bytes: &[u8] = include_bytes!(
-            "../../hayro-tests/pdfs/custom/andler-optimal-lot-size_linearized.pdf"
-        );
+        let bytes: &[u8] =
+            include_bytes!("../../beeld-tests/pdfs/custom/andler-optimal-lot-size_linearized.pdf");
         let pdf = Pdf::new(bytes.to_vec()).expect("linearized fixture loads");
-        let trailer = pdf
-            .xref()
-            .first_page_trailer()
-            .expect("first-page trailer");
+        let trailer = pdf.xref().first_page_trailer().expect("first-page trailer");
         let size: i32 = trailer.get(b"Size").expect("Size");
         assert!(size > 0);
     }
@@ -426,9 +413,7 @@ mod tests {
         pdf.extend_from_slice(b"0000000000 65535 f \n");
         pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
         pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
-        pdf.extend_from_slice(
-            b"trailer\n<< /Size 3 /Root 1 0 R /ID [<AAAA> <BBBB>] >>\n",
-        );
+        pdf.extend_from_slice(b"trailer\n<< /Size 3 /Root 1 0 R /ID [<AAAA> <BBBB>] >>\n");
         pdf.extend_from_slice(format!("startxref\n{xref_a_pos}\n%%EOF\n").as_bytes());
 
         // Incremental update: add obj 3, chained via /Prev to xref_a_pos.
@@ -492,9 +477,8 @@ mod tests {
     #[cfg(feature = "inspect")]
     #[test]
     fn latest_trailer_for_linearized_fixture_differs_from_trailer() {
-        let bytes: &[u8] = include_bytes!(
-            "../../hayro-tests/pdfs/custom/andler-optimal-lot-size_linearized.pdf"
-        );
+        let bytes: &[u8] =
+            include_bytes!("../../beeld-tests/pdfs/custom/andler-optimal-lot-size_linearized.pdf");
         let pdf = Pdf::new(bytes.to_vec()).expect("linearized fixture loads");
         assert!(pdf.is_linearized());
 
@@ -520,4 +504,3 @@ mod tests {
         assert!(dummy.latest_trailer().is_none());
     }
 }
-

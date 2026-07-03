@@ -346,7 +346,7 @@ mod tests {
     #[test]
     fn file_layout_matches_real_fixture() {
         let bytes: &[u8] =
-            include_bytes!("../../hayro-tests/pdfs/custom/andler-optimal-lot-size.pdf");
+            include_bytes!("../../beeld-tests/pdfs/custom/andler-optimal-lot-size.pdf");
         let pdf = Pdf::new(bytes.to_vec()).expect("fixture loads");
         let layout = pdf.file_layout();
         assert!(!layout.eof_offsets.is_empty());
@@ -359,7 +359,7 @@ mod tests {
     #[test]
     fn file_layout_is_cached() {
         let bytes: &[u8] =
-            include_bytes!("../../hayro-tests/pdfs/custom/andler-optimal-lot-size.pdf");
+            include_bytes!("../../beeld-tests/pdfs/custom/andler-optimal-lot-size.pdf");
         let pdf = Pdf::new(bytes.to_vec()).expect("fixture loads");
         let first = pdf.file_layout() as *const _;
         let second = pdf.file_layout() as *const _;
@@ -368,8 +368,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "vendored copy omits hayro-tests/downloads/ — restore the upstream hayro-tests \
-                submodule to run this fixture; the mangwhap vendor of hayro-syntax \
+    #[ignore = "vendored copy omits beeld-tests/downloads/ — restore the upstream beeld-tests \
+                submodule to run this fixture; the mangwhap vendor of beeld-syntax \
                 ships only the `pdfs/custom/` fixtures referenced by `include_bytes!`"]
     fn pdf_version_header() {
         let data = std::fs::read("../beeld-tests/downloads/pdfjs/alphatrans.pdf").unwrap();
@@ -379,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "vendored copy omits hayro-tests/downloads/ — see pdf_version_header"]
+    #[ignore = "vendored copy omits beeld-tests/downloads/ — see pdf_version_header"]
     fn pdf_version_catalog() {
         let data = std::fs::read("../beeld-tests/downloads/pdfbox/2163.pdf").unwrap();
         let pdf = Pdf::new(data).unwrap();
@@ -433,7 +433,7 @@ mod tests {
     #[test]
     fn streamed_parse_matches_resident() {
         let bytes: &[u8] =
-            include_bytes!("../../hayro-tests/pdfs/custom/andler-optimal-lot-size.pdf");
+            include_bytes!("../../beeld-tests/pdfs/custom/andler-optimal-lot-size.pdf");
 
         let resident = Pdf::new(bytes.to_vec()).expect("resident fixture loads");
 
@@ -462,7 +462,7 @@ mod tests {
     #[test]
     fn streamed_open_reads_less_than_whole_file() {
         let bytes: &[u8] =
-            include_bytes!("../../hayro-tests/pdfs/custom/andler-optimal-lot-size.pdf");
+            include_bytes!("../../beeld-tests/pdfs/custom/andler-optimal-lot-size.pdf");
 
         let bytes_read = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let source = CountingReadAt {
@@ -492,7 +492,7 @@ mod tests {
     #[test]
     fn streamed_multi_section_xref_streams() {
         let bytes: &[u8] =
-            include_bytes!("../../hayro-tests/pdfs/custom/andler-optimal-lot-size_linearized.pdf");
+            include_bytes!("../../beeld-tests/pdfs/custom/andler-optimal-lot-size_linearized.pdf");
 
         let resident = Pdf::new(bytes.to_vec()).expect("resident fixture loads");
         let streamed = Pdf::new_with_reader(CountingReadAt {

@@ -177,11 +177,10 @@ impl<'a> Readable<'a> for String<'a> {
         // Apply decryption if needed.
         let final_inner = if ctx.xref().needs_decryption(ctx) {
             if let Some(obj_number) = ctx.obj_number() {
-                match ctx.xref().decrypt(
-                    obj_number,
-                    inner.decoded(),
-                    DecryptionTarget::String,
-                ) {
+                match ctx
+                    .xref()
+                    .decrypt(obj_number, inner.decoded(), DecryptionTarget::String)
+                {
                     Some(plaintext) => StringInner::Decrypted {
                         source: inner.source(),
                         kind: inner.kind(),
@@ -574,7 +573,7 @@ mod tests {
         use crate::object::{Dict, Object};
         use alloc::vec::Vec;
 
-        let bytes: &[u8] = include_bytes!("../../../hayro-tests/pdfs/custom/encrypted_aes_128.pdf");
+        let bytes: &[u8] = include_bytes!("../../../beeld-tests/pdfs/custom/encrypted_aes_128.pdf");
         let pdf = Pdf::new(bytes.to_vec()).expect("fixture loads");
 
         fn walk_object<'a>(obj: &Object<'a>, out: &mut Vec<String<'a>>) {
@@ -622,7 +621,10 @@ mod tests {
                 break;
             }
         }
-        assert!(found_any_non_empty, "no non-empty decrypted string in fixture");
+        assert!(
+            found_any_non_empty,
+            "no non-empty decrypted string in fixture"
+        );
         assert!(
             found_ciphertext_differs,
             "expected at least one decrypted string whose ciphertext source \

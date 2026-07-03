@@ -199,8 +199,8 @@ pub(crate) fn scan_indirect_layout(data: &[u8], offset: usize) -> Option<Indirec
 
     // The byte immediately before `endobj` — relative to the full data
     // slice, not to `tail` — determines the preceding-EOL flag.
-    let endobj_preceded_by_eol = endobj_pos > 0
-        && matches!(data.get(endobj_pos - 1), Some(b'\n') | Some(b'\r'));
+    let endobj_preceded_by_eol =
+        endobj_pos > 0 && matches!(data.get(endobj_pos - 1), Some(b'\n') | Some(b'\r'));
     let endobj_followed_by_eol = match data.get(endobj_end) {
         None => true,
         Some(b'\n') | Some(b'\r') => true,
