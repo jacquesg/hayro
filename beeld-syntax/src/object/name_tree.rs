@@ -118,7 +118,7 @@ impl<'a> NameTree<'a> {
     /// `visited` set of node ids — the guard that makes each shared subtree
     /// and `/Kids` cycle enter at most once — gains at most one id per
     /// `/Kids` entry the walk examines. Examining an entry spends a unit of
-    /// the traversal budget before the insert (see [`KidsCursor::next_child`]),
+    /// the traversal budget before the insert (see `KidsCursor::next_child`),
     /// so the set is bounded by `MAX_NODE_VISITS`, keeping the walk
     /// memory-safe.
     pub fn iter(&self) -> NameTreeIter<'a> {
