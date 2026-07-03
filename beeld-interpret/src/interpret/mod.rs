@@ -27,6 +27,8 @@ use std::sync::Arc;
 
 pub(crate) mod path;
 pub(crate) mod state;
+#[cfg(test)]
+mod tests;
 pub(crate) mod text;
 
 pub use state::ActiveTransferFunction;
@@ -474,13 +476,23 @@ pub fn interpret<'a>(
                 });
             }
             TypedInstruction::BeginMarkedContentWithProperties(bdc) => {
-                // Properties can be either:
-                // 1. A Name that references an entry in the Resources/Properties dictionary
-                // 2. An inline dictionary with an OC key
+                // The properties operand is either a name referencing an entry in
+                // the Resources /Properties dictionary, or an inline dictionary
+                // (ISO 32000-1 §14.6.2, "Property lists"). Resolve it to one dict
+                // so /MCID and /ActualText are read for both forms; a named
+                // reference previously dropped them, because dict_or_stream returns
+                // None for a Name.
+                let props = bdc
+                    .1
+                    .clone()
+                    .into_name()
+                    .and_then(|name| resources.properties.get::<Dict<'_>>(name))
+                    .or_else(|| dict_or_stream(bdc.1).map(|(dict, _)| dict.clone()));
 
-                let mcid = dict_or_stream(bdc.1).and_then(|(props, _)| props.get::<i32>(MCID));
-                let actual_text = dict_or_stream(bdc.1)
-                    .and_then(|(props, _)| props.get::<String<'_>>(ACTUAL_TEXT));
+                let mcid = props.as_ref().and_then(|p| p.get::<i32>(MCID));
+                let actual_text = props
+                    .as_ref()
+                    .and_then(|p| p.get::<String<'_>>(ACTUAL_TEXT));
 
                 let oc = bdc
                     .1

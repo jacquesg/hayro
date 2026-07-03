@@ -5,6 +5,11 @@ use crate::{DrawMode, DrawProps, ImageDrawProps};
 use kurbo::{Affine, BezPath, Rect, Shape};
 
 /// A trait for a device that can be used to process PDF drawing instructions.
+///
+/// Note: [`begin_marked_content`](Device::begin_marked_content) gained an
+/// `actual_text` parameter, a source-breaking change to this trait. This fork
+/// has no external implementors, so the break is accepted rather than absorbed
+/// behind a struct.
 pub trait Device<'a> {
     /// Draw a path.
     fn draw_path(&mut self, path: &BezPath, props: DrawProps<'a>, draw_mode: &DrawMode);
@@ -47,9 +52,9 @@ pub trait Device<'a> {
     /// The tag is the marked content tag (e.g. b"P", b"Span"). The mcid is the
     /// marked content identifier from the properties dict, if present.
     /// `actual_text` carries the raw `/ActualText` string bytes (PDF text-string
-    /// encoding — UTF-16BE or `PDFDocEncoded`) from the properties dict, if present;
-    /// a recording device can use it as the text for glyphs that lack a `ToUnicode`
-    /// mapping (e.g. colour-emoji glyphs).
+    /// encoding — UTF-16BE, UTF-8, or `PDFDocEncoding`; see ISO 32000-2 §7.9.2.2)
+    /// from the properties dict, if present; a recording device can use it as the
+    /// text for glyphs that lack a `ToUnicode` mapping (e.g. colour-emoji glyphs).
     fn begin_marked_content(
         &mut self,
         _tag: &[u8],
@@ -59,14 +64,23 @@ pub trait Device<'a> {
     }
     /// Called at the end of a marked content sequence (EMC).
     fn end_marked_content(&mut self) {}
-    /// Called immediately before the glyphs of a single text-showing operator
-    /// (`Tj`, `TJ`, `'`, `"`) are drawn, and again after the last of them.
+    /// Called immediately before and after each single text-showing operator
+    /// (`Tj`, `TJ`, `'`, `"`).
     ///
-    /// One operator corresponds to one PDF text object; a recording device can
+    /// One run corresponds to one text-showing operator; a recording device can
     /// bracket on these to group glyphs into runs that mirror the content
     /// stream's own text-show operators — the same segmentation a viewer's text
     /// layer exposes — instead of inferring run boundaries from glyph geometry.
     /// Rendering devices ignore them. Default: no-op.
+    ///
+    /// A run may bracket zero [`draw_glyph`](Device::draw_glyph) calls (an empty
+    /// string, no resolvable font, glyphs suppressed by an optional-content
+    /// group, or a clip-only text-rendering mode). Consumers must key off
+    /// `draw_glyph`, not assume a run is non-empty.
+    ///
+    /// The interpreter emits runs flat, never nested. A device that re-interprets
+    /// a Type 3 glyph's content stream may itself nest runs; that is the device's
+    /// concern, not the interpreter's.
     fn begin_glyph_run(&mut self) {}
     /// Called after the last glyph of a text-showing operator. See
     /// [`begin_glyph_run`](Device::begin_glyph_run).
