@@ -53,6 +53,14 @@ use smallvec::SmallVec;
 // (ISO 32000-1 §8.6.6.5), which spill onto the heap.
 const OPERANDS_THRESHOLD: usize = 10;
 
+/// Hard ceiling on the operands accumulated for a single instruction — a
+/// memory-DoS guard. A conformant instruction uses at most ~32 operands (a
+/// `DeviceN` colour space has up to 32 components, ISO 32000-1 §8.6.6.5), so
+/// this sits far above any legitimate stream; a malformed operand-only run
+/// (e.g. `1 1 1 …` with no operator) is bounded here instead of growing the
+/// stack without limit.
+const MAX_OPERANDS: usize = 512;
+
 impl Debug for Operator<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", self.0.as_str())
@@ -480,7 +488,13 @@ impl<'a> Stack<'a> {
     }
 
     fn push(&mut self, operand: Object<'a>) -> Option<()> {
-        self.data.push(operand);
+        // Silently drop operands past MAX_OPERANDS: a legitimate instruction
+        // never approaches the cap, and this bounds a malformed operand-only
+        // run without the "halt the whole stream" behaviour that returning
+        // `None` here would trigger at the call site.
+        if self.data.len() < MAX_OPERANDS {
+            self.data.push(operand);
+        }
         Some(())
     }
 

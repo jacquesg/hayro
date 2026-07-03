@@ -1933,6 +1933,12 @@ fn collect_sections(
     if !visited.insert(pos) {
         return;
     }
+    // Bound the /Prev chain depth exactly like the production walkers
+    // (populate_xref_impl_inner / populate_xref_streamed_inner) so a long
+    // acyclic chain of distinct offsets cannot overflow the native stack.
+    if visited.len() > MAX_XREF_CHAIN_DEPTH {
+        return;
+    }
     let Some(tail) = data.get(pos..) else {
         return;
     };

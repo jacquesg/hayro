@@ -52,6 +52,13 @@ impl<'a> Array<'a> {
     pub fn data(&self) -> &'a [u8] {
         self.data
     }
+
+    /// The reader context in which this array's elements should be
+    /// resolved. Needed by callers that drive [`Array::raw_iter`] and
+    /// resolve the yielded [`MaybeRef`] tokens themselves.
+    pub(crate) fn ctx(&self) -> &ReaderContext<'a> {
+        &self.ctx
+    }
 }
 
 impl Debug for Array<'_> {

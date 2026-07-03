@@ -75,7 +75,7 @@ ci-nostd:
 # (read beeld-tests/downloads/*.pdf). Every other crate's unit tests run in full;
 # demo (wasm) and fuzz excluded too.
 ci-test:
-    mise exec -- cargo nextest run --locked --workspace --exclude beeld-demo --exclude beeld-fuzz --exclude beeld-jbig2 --exclude beeld-jpeg2000 -E 'not (package(beeld-tests) and not test(/load::/)) and not (package(beeld-syntax) and test(/pdf_version/))'
+    mise exec -- cargo nextest run --locked --workspace --all-features --exclude beeld-demo --exclude beeld-fuzz --exclude beeld-jbig2 --exclude beeld-jpeg2000 -E 'not (package(beeld-tests) and not test(/load::/)) and not (package(beeld-syntax) and test(/pdf_version/))'
 
 # rustdoc with warnings denied (a broken intra-doc link fails the gate).
 ci-doc:
