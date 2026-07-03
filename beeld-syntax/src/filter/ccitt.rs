@@ -6,8 +6,8 @@ use crate::object::stream::{FilterResult, ImageColorSpace, ImageData, ImageDecod
 use alloc::borrow::Cow;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::iter;
 use beeld_ccitt::{DecodeSettings, Decoder, DecoderContext, EncodingMode};
+use core::iter;
 
 pub(crate) fn decode(
     data: &[u8],

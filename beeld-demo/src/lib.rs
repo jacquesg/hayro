@@ -1,7 +1,7 @@
-use console_error_panic_hook;
 use beeld::beeld_interpret::InterpreterSettings;
 use beeld::beeld_syntax::Pdf;
 use beeld::{RenderCache, RenderSettings};
+use console_error_panic_hook;
 use js_sys;
 use vello_cpu::color::palette::css::WHITE;
 use wasm_bindgen::prelude::*;

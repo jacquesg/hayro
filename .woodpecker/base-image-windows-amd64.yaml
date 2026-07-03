@@ -1,0 +1,49 @@
+# beeld-ci-base (windows/amd64 arch): builds ci-base-windows.Dockerfile and pushes
+# it to the per-arch PIN tags :latest-windows + :<sha>-windows on the SAME
+# beeld-ci-base repo as the linux arches; base-image-stitch.yaml assembles all three
+# arches into the multi-arch beeld-ci-base:latest. Runs on bare servercore +
+# downloads a docker CLI; the build logic is scripts/ci/base-image-windows-build.ps1.
+# Same union path filter as the other base-image workflows.
+
+when:
+  - event: [push, manual]
+    path:
+      include:
+        - mise.toml
+        - ci-base.Dockerfile
+        - ci-base.Dockerfile.dockerignore
+        - ci-base-windows.Dockerfile
+        - scripts/ci/base-image-windows-build.ps1
+        - .woodpecker/base-image-linux-amd64.yaml
+        - .woodpecker/base-image-linux-arm64.yaml
+        - .woodpecker/base-image-windows-amd64.yaml
+        - .woodpecker/base-image-stitch.yaml
+      on_empty: false
+
+labels:
+  platform: windows/amd64
+
+# plugin-git is multi-arch; the daemon resolves the windows variant here.
+clone:
+  - name: clone
+    image: git.bloudraad.io/bloudraad/plugin-git:latest
+    pull: true
+
+steps:
+  - name: build-push
+    image: mcr.microsoft.com/windows/servercore:10.0.26100.7462
+    when:
+      - event: push
+        branch: main
+      - event: manual
+    environment:
+      REG_USER:
+        from_secret: forge_registry_user
+      REG_TOKEN:
+        from_secret: forge_registry_token
+      # Passed through as a --build-arg by the build script — authenticates mise's
+      # GitHub API calls in the docker build.
+      GITHUB_TOKEN:
+        from_secret: github_token
+    commands:
+      - 'Set-ExecutionPolicy Bypass -Scope Process -Force; & ./scripts/ci/base-image-windows-build.ps1'

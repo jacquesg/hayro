@@ -1,0 +1,38 @@
+# beeld engine gate (windows/amd64-msvc). Runs the nextest suite natively for
+# x86_64-pc-windows-msvc on the beeld-ci-base windows image (docker backend,
+# windows containers) — the windows half of the old tests-cross-platform job. The
+# host-invariant lanes (fmt/clippy/features/nostd/doc/deny) run once on Linux
+# (engine-linux-amd64.yaml). The windows image has no bash, so the gate is PowerShell
+# (scripts/ci/win-gate.ps1).
+#
+# push only: matches base-image-windows (the image is pushed on push to main); the
+# forge registry secrets are not exposed to pull_request pipelines.
+
+labels:
+  platform: windows/amd64
+
+when:
+  - event: [push, manual]
+
+# plugin-git is multi-arch; the daemon resolves the windows variant. The trusted
+# clone plugin gets CI_NETRC, so it authenticates the private-repo clone (no manual
+# token dance, unlike the darwin local backend).
+clone:
+  - name: clone
+    image: git.bloudraad.io/bloudraad/plugin-git:latest
+    pull: true
+
+steps:
+  - name: engine
+    # Pull the OWN windows pin, not the stitched multi-arch :latest — a single-arch
+    # image always resolves on this agent (no manifest-list os.version matching).
+    image: git.bloudraad.io/bloudraad/beeld-ci-base:latest-windows
+    # A moving tag — force a re-pull so a base-image rebuild is picked up.
+    pull: true
+    environment:
+      CARGO_TERM_COLOR: always
+      # mise's GitHub API calls (tool version checks) — lift the shared rate limit.
+      GITHUB_TOKEN:
+        from_secret: github_token
+    commands:
+      - 'Set-ExecutionPolicy Bypass -Scope Process -Force; & ./scripts/ci/win-gate.ps1'

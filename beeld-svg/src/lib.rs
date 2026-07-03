@@ -22,8 +22,8 @@ use crate::mask::MaskKind;
 use crate::paint::{
     CachedNativeGradient, CachedShading, CachedShadingPattern, CachedTilingPattern,
 };
-use beeld_interpret::font::Glyph;
 use beeld_interpret::beeld_syntax::page::Page;
+use beeld_interpret::font::Glyph;
 use beeld_interpret::util::{Float32Ext, TransformExt};
 use beeld_interpret::{
     BlendMode, CacheKey, ClipPath, Context, Device, DrawMode, DrawProps, Image, ImageDrawProps,

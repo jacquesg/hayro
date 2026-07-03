@@ -1,0 +1,36 @@
+[tools]
+# Rust toolchain. mise is the EXCLUSIVE source of truth for the channel and the
+# components (there is no rust-toolchain.toml). Channel 1.96.1 — the org baseline,
+# matching moegoe/sdk/mangwhap/bladsy — with rustfmt + clippy. beeld's declared
+# MSRV is 1.92 (Cargo.toml); the baseline builds it fine, the MSRV is only the floor.
+#
+# The no_std cross-target (thumbv6m-none-eabi) is provisioned by `just ci-nostd`
+# itself (`rustup target add`, idempotent), so the gate is self-contained and mise
+# stays the toolchain source without relying on a `targets` list.
+rust = { version = "1.96.1", profile = "minimal", components = "rustfmt,clippy" }
+
+# just, the task runner. Every CI gate is `just <recipe>` (each recipe wraps its
+# tools in `mise exec`), so the Justfile is the single source of truth shared by
+# local dev and CI (.woodpecker/README.md).
+just = "1.51.0"
+
+# cargo tooling, installed as PREBUILT binaries via cargo.binstall (see
+# [settings]) so `mise install` never compiles them from source:
+#   cargo-nextest : the test runner (`just ci-test`)
+#   cargo-deny    : the supply-chain gate (`just ci-deny`)
+#   cargo-hack    : the per-feature gate (`just ci-features`, --each-feature)
+"cargo:cargo-nextest" = "0.9.137"
+"cargo:cargo-deny" = "0.19.8"
+"cargo:cargo-hack" = "0.6.33"
+
+# sccache, the compiler cache. `RUSTC_WRAPPER=sccache` (set, guarded, by
+# ci-engine) routes every rustc through it, keyed by a CONTENT hash (mtime-immune),
+# so a persistent SCCACHE_DIR on the agent /cache volume makes unchanged crates
+# cache-hit across runs. aqua backend, prebuilt — matches moegoe/mangwhap. A no-op
+# locally without /cache.
+"aqua:mozilla/sccache" = "0.15.0"
+
+[settings]
+# Install `cargo:` backend tools with cargo-binstall (prebuilt release binaries)
+# instead of compiling from source. mise auto-bootstraps cargo-binstall.
+cargo.binstall = true

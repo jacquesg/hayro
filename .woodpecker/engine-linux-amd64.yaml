@@ -1,0 +1,53 @@
+# beeld engine gate: the whole host-invariant Rust gate in ONE workflow/step —
+# rustfmt + clippy + per-feature check (cargo-hack) + no_std + nextest + rustdoc
+# + cargo-deny — on the beeld-ci-base image. Always runs on every
+# push and pull_request, never path-filtered (a push must not go green having
+# validated nothing). Verify-only.
+#
+# WHY ONE STEP: each Woodpecker workflow clones the repo and runs in its own
+# container, and the in-clone build state does not survive between containers.
+# Running every check in ONE container shares one clone and one CARGO_TARGET_DIR,
+# so clippy compiles the workspace once and the tests/doc reuse those artefacts.
+#
+# Caching: cargo + sccache caches live on the agent's persistent /cache volume,
+# NOT baked in the image. Set in the commands (not environment:) so
+# ${CI_REPO_NAME}/${CI_WORKFLOW_NAME} resolve in the step shell ($$ escapes
+# Woodpecker's own substitution). Degrades to a cold compile without /cache; the
+# FIRST run per agent cold-compiles the vello/resvg/usvg graph, so
+# raise that run's timeout.
+
+when:
+  - event: [push, pull_request]
+
+# Linux-only image; without this pin the scheduler could hand the workflow to a
+# Windows/darwin agent that cannot pull it.
+labels:
+  platform: linux/amd64
+
+steps:
+  - name: engine
+    # Pull the OWN per-arch pin, not the stitched multi-arch :latest — a single-arch
+    # image always resolves on this agent (no manifest-list resolution).
+    image: git.bloudraad.io/bloudraad/beeld-ci-base:latest-linux-amd64
+    # A moving tag — force a re-pull each run, else the agent reuses the first image
+    # it cached and never picks up a base-image rebuild.
+    pull: true
+    environment:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"        # sccache cannot cache incremental compilation
+      SCCACHE_CACHE_SIZE: 20G
+      # mise/binstall resolve tool versions and fetch prebuilts via the GitHub
+      # API; authenticate to lift the shared unauthenticated (~60/hr) rate limit.
+      GITHUB_TOKEN:
+        from_secret: github_token
+    commands:
+      # Redirect cargo + sccache onto the persistent /cache volume (a no-op
+      # without it). CARGO_HOME + SCCACHE_DIR are per-repo; CARGO_TARGET_DIR is
+      # per-workflow (cargo locks the target dir, so concurrent runs of the same
+      # workflow serialise rather than corrupt). RUSTC_WRAPPER is set, guarded,
+      # by `just ci-engine`.
+      - export CARGO_HOME="/cache/cargo/$${CI_REPO_NAME}"
+      - export CARGO_TARGET_DIR="/cache/target/$${CI_REPO_NAME}/$${CI_WORKFLOW_NAME}"
+      - export SCCACHE_DIR="/cache/sccache/$${CI_REPO_NAME}"
+      - mise trust --all
+      - just ci-engine

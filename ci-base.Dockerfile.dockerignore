@@ -1,0 +1,14 @@
+# beeld-ci-base build context. The Dockerfile COPYs only mise.toml, so exclude
+# everything else — VCS, build output, and the heavy asset/reference trees — to
+# keep the context transfer tiny.
+.git
+.github
+.woodpecker
+target
+**/target
+refs
+assets
+store
+diffs
+Dockerfile
+.dockerignore

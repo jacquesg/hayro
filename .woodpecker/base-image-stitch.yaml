@@ -1,0 +1,60 @@
+# beeld-ci-base multi-arch manifest stitch: assembles beeld-ci-base:latest + :<sha>
+# FROM the per-arch PIN tags pushed by base-image-{linux-amd64,linux-arm64,windows}.
+# Its OWN workflow (NOT bolted onto an arch build, which would have to poll for the
+# other pins — a race that throws when a pin is not yet pushed): it depends_on all
+# three builds, so it runs only after every arch's pin exists, no polling.
+# `docker buildx imagetools create` is registry-only (no docker daemon), so it runs
+# in a plain, UNPRIVILEGED docker:cli step on a linux agent. The stitch REFERENCES the
+# per-arch pins, never overwrites them, so each arch manifest stays servable under the
+# stitched lists.
+
+when:
+  - event: [push, pull_request, manual]
+    path:
+      include:
+        - mise.toml
+        - ci-base.Dockerfile
+        - ci-base.Dockerfile.dockerignore
+        - ci-base-windows.Dockerfile
+        - scripts/ci/base-image-windows-build.ps1
+        - .woodpecker/base-image-linux-amd64.yaml
+        - .woodpecker/base-image-linux-arm64.yaml
+        - .woodpecker/base-image-windows-amd64.yaml
+        - .woodpecker/base-image-stitch.yaml
+      on_empty: false
+
+# Run only after every per-arch build has pushed its pin (workflow filenames w/o ext).
+depends_on:
+  - base-image-linux-amd64
+  - base-image-linux-arm64
+  - base-image-windows-amd64
+
+labels:
+  platform: linux/amd64
+
+# Registry-only (imagetools reads + writes tags); no checkout needed.
+skip_clone: true
+
+steps:
+  - name: stitch
+    image: docker.io/docker:28-cli
+    when:
+      - event: push
+        branch: main
+      - event: manual
+    environment:
+      FORGE_REGISTRY_USER:
+        from_secret: forge_registry_user
+      FORGE_REGISTRY_TOKEN:
+        from_secret: forge_registry_token
+    commands:
+      # Daemonless: no privilege, no mounted socket. Stitch the immutable :<sha> from
+      # the per-sha pins, then move :latest from the per-arch pins.
+      - |
+        set -eu
+        repo=git.bloudraad.io/bloudraad/beeld-ci-base
+        printf '%s' "$FORGE_REGISTRY_TOKEN" | docker login git.bloudraad.io -u "$FORGE_REGISTRY_USER" --password-stdin
+        docker buildx imagetools create -t "$repo:$CI_COMMIT_SHA" \
+          "$repo:$CI_COMMIT_SHA-linux-amd64" "$repo:$CI_COMMIT_SHA-linux-arm64" "$repo:$CI_COMMIT_SHA-windows"
+        docker buildx imagetools create -t "$repo:latest" \
+          "$repo:latest-linux-amd64" "$repo:latest-linux-arm64" "$repo:latest-windows"

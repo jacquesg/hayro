@@ -1,0 +1,49 @@
+# beeld Rust dependency policy (cargo-deny). Run by `just ci-deny`, part of the
+# ci-engine gate. Models the org policy (moegoe/sdk/bladsy) scoped to beeld's tree.
+
+[advisories]
+yanked = "deny"
+# All three are TEST-ONLY transitive advisories with no safe upgrade, reachable
+# only through dev-dependencies (confirmed: `cargo tree -i <crate> -e no-dev` is
+# empty for each), so they never ship in beeld's library crates.
+ignore = [
+  # number_prefix (unmaintained) <- indicatif, a dev-dep progress bar in beeld-jbig2.
+  { id = "RUSTSEC-2025-0119", reason = "number_prefix unmaintained; via indicatif, dev-only, no safe upgrade" },
+  # remove_dir_all TOCTOU + tempdir deprecated <- sitro -> tempdir, the visual-
+  # regression renderer, a dev-dep of beeld-tests (its suite is not run in CI).
+  { id = "RUSTSEC-2023-0018", reason = "remove_dir_all TOCTOU; via sitro/tempdir, dev-only test tooling" },
+  { id = "RUSTSEC-2018-0017", reason = "tempdir deprecated; via sitro, dev-only test tooling" },
+  # ttf-parser unmaintained (not a vulnerability) <- resvg/usvg/fontdb/rustybuzz,
+  # reaching only the non-published beeld-tests harness (SVG comparison). Same
+  # waiver as bladsy/moegoe; beeld's own font stack is skrifa.
+  { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained; transitive via resvg/usvg into the non-published test harness only" },
+]
+
+[licenses]
+confidence-threshold = 0.93
+allow = [
+  "Apache-2.0", "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause", "BSD-3-Clause", "MIT",
+  "ISC", "NCSA", "MPL-2.0", "Zlib", "Unicode-3.0",
+  "CC0-1.0", "Unlicense", "CDLA-Permissive-2.0",
+]
+
+[licenses.private]
+# beeld's own crates are proprietary (LicenseRef-Proprietary) and publish=false,
+# so they are not licence-checked.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Internal path-deps may declare a `*` version; registry wildcards stay banned.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# The git dependencies beeld consumes (public upstream, pinned by rev in Cargo.toml).
+allow-git = [
+  "https://github.com/LaurenzV/sitro",
+  "https://github.com/linebender/vello",
+]

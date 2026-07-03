@@ -1,0 +1,76 @@
+# beeld-ci-base (linux/amd64 arch): builds ci-base.Dockerfile and pushes the amd64
+# arch to the per-arch PIN tags :latest-linux-amd64 + :<sha>-linux-amd64.
+# base-image-linux-arm64.yaml builds the arm64 pins, base-image-windows-amd64.yaml the
+# windows pins; base-image-stitch.yaml (a SEPARATE workflow that depends_on all
+# three) assembles the multi-arch beeld-ci-base:latest + :<sha> the engine gates
+# pull. Rebuilds only when the toolchain (mise.toml) or an image definition changes,
+# never on a dependency bump.
+#
+# The pin tags keep each arch's manifest BOUND in the registry so it stays servable;
+# the stitch REFERENCES them WITHOUT overwriting (overwriting a pin with the manifest
+# list orphans that arch -> pulls 404). provenance: false keeps the pushed manifest a
+# plain single-entry image so the stitch assembles a clean N-entry list.
+#
+# The path filter is the UNION of all base-image triggers, so a change to ANY arch
+# (or the stitch) lands all four base-image workflows in ONE pipeline and the stitch
+# sees every fresh pin. The buildx plugin tag is pinned: the server allow-lists
+# exactly woodpeckerci/plugin-docker-buildx via WOODPECKER_PLUGINS_PRIVILEGED.
+#
+#   push to main / manual : build + push the amd64 pins
+#   pull_request          : dry_run (the push secret is not exposed to PRs)
+
+when:
+  - event: [push, pull_request, manual]
+    path:
+      include:
+        - mise.toml
+        - ci-base.Dockerfile
+        - ci-base.Dockerfile.dockerignore
+        - ci-base-windows.Dockerfile
+        - scripts/ci/base-image-windows-build.ps1
+        - .woodpecker/base-image-linux-amd64.yaml
+        - .woodpecker/base-image-linux-arm64.yaml
+        - .woodpecker/base-image-windows-amd64.yaml
+        - .woodpecker/base-image-stitch.yaml
+      on_empty: false
+
+labels:
+  platform: linux/amd64
+
+steps:
+  - name: build-push
+    image: woodpeckerci/plugin-docker-buildx:6
+    when:
+      - event: push
+        branch: main
+      - event: manual
+    environment:
+      # Passed into the build as a BuildKit secret (settings.secrets below) so the
+      # Dockerfile's mise install GitHub-release fetches are authenticated.
+      GITHUB_TOKEN:
+        from_secret: github_token
+    settings:
+      registry: git.bloudraad.io
+      repo: git.bloudraad.io/bloudraad/beeld-ci-base
+      dockerfile: ci-base.Dockerfile
+      platforms: linux/amd64
+      secrets:
+        - id=GITHUB_TOKEN
+      provenance: "false"
+      tags:
+        - latest-linux-amd64
+        - ${CI_COMMIT_SHA}-linux-amd64
+      username:
+        from_secret: forge_registry_user
+      password:
+        from_secret: forge_registry_token
+
+  - name: build-dryrun
+    image: woodpeckerci/plugin-docker-buildx:6
+    when:
+      - event: pull_request
+    settings:
+      repo: git.bloudraad.io/bloudraad/beeld-ci-base
+      dockerfile: ci-base.Dockerfile
+      platforms: linux/amd64
+      dry_run: true

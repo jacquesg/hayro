@@ -1,0 +1,63 @@
+# beeld-ci-base (linux/arm64 arch): the arm64 build of the tooling image, pushed to
+# the per-arch PIN tags :latest-linux-arm64 + :<sha>-linux-arm64. Built NATIVELY on a
+# linux/arm64 agent — a QEMU-emulated cross-arch build of the rust/mise toolchain is
+# far too slow (it times out in the emulated mise install). The SAME ci-base.Dockerfile
+# as amd64 (mise resolves the arch-native toolchain). base-image-stitch.yaml assembles
+# these pins with the amd64 + windows pins into the multi-arch :latest.
+#
+# Prerequisite (operator-owned): a persistent linux/arm64 agent online. Same union
+# path filter as the other base-image workflows, so all arches stay in lockstep.
+
+when:
+  - event: [push, pull_request, manual]
+    path:
+      include:
+        - mise.toml
+        - ci-base.Dockerfile
+        - ci-base.Dockerfile.dockerignore
+        - ci-base-windows.Dockerfile
+        - scripts/ci/base-image-windows-build.ps1
+        - .woodpecker/base-image-linux-amd64.yaml
+        - .woodpecker/base-image-linux-arm64.yaml
+        - .woodpecker/base-image-windows-amd64.yaml
+        - .woodpecker/base-image-stitch.yaml
+      on_empty: false
+
+labels:
+  platform: linux/arm64
+
+steps:
+  - name: build-push
+    image: woodpeckerci/plugin-docker-buildx:6
+    when:
+      - event: push
+        branch: main
+      - event: manual
+    environment:
+      GITHUB_TOKEN:
+        from_secret: github_token
+    settings:
+      registry: git.bloudraad.io
+      repo: git.bloudraad.io/bloudraad/beeld-ci-base
+      dockerfile: ci-base.Dockerfile
+      platforms: linux/arm64
+      secrets:
+        - id=GITHUB_TOKEN
+      provenance: "false"
+      tags:
+        - latest-linux-arm64
+        - ${CI_COMMIT_SHA}-linux-arm64
+      username:
+        from_secret: forge_registry_user
+      password:
+        from_secret: forge_registry_token
+
+  - name: build-dryrun
+    image: woodpeckerci/plugin-docker-buildx:6
+    when:
+      - event: pull_request
+    settings:
+      repo: git.bloudraad.io/bloudraad/beeld-ci-base
+      dockerfile: ci-base.Dockerfile
+      platforms: linux/arm64
+      dry_run: true

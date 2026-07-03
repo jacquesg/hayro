@@ -4,8 +4,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use beeld_jpeg2000::{DecodeSettings, DecoderContext, Image};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use serde::Deserialize;
 
 const INPUT_MANIFESTS: &[(&str, &str)] = &[

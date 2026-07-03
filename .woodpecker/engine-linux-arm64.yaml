@@ -1,0 +1,29 @@
+# beeld engine gate (linux/arm64). Runs the nextest suite natively on the arm64
+# agent to catch arch-specific breakage. The host-invariant lanes
+# (fmt/clippy/features/nostd/doc/deny) run once on amd64 (engine-linux-amd64.yaml); this
+# runs only the tests, like the darwin/windows gates. Pulls its OWN per-arch pin
+# (:latest-linux-arm64) rather than the stitched multi-arch :latest — a single-arch
+# image always resolves on this agent, with no manifest-list variant matching.
+
+when:
+  - event: [push, pull_request]
+
+labels:
+  platform: linux/arm64
+
+steps:
+  - name: engine
+    image: git.bloudraad.io/bloudraad/beeld-ci-base:latest-linux-arm64
+    pull: true
+    environment:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_CACHE_SIZE: 20G
+      GITHUB_TOKEN:
+        from_secret: github_token
+    commands:
+      - export CARGO_HOME="/cache/cargo/$${CI_REPO_NAME}"
+      - export CARGO_TARGET_DIR="/cache/target/$${CI_REPO_NAME}/$${CI_WORKFLOW_NAME}"
+      - export SCCACHE_DIR="/cache/sccache/$${CI_REPO_NAME}"
+      - mise trust --all
+      - just ci-test

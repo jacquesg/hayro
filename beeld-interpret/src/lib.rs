@@ -50,12 +50,12 @@ pub mod pattern;
 pub mod shading;
 pub mod util;
 
+pub use beeld_cmap;
+pub use beeld_syntax;
 pub use cache::CacheKey;
 pub use context::*;
 pub use device::*;
 pub use function::Function;
-pub use beeld_cmap;
-pub use beeld_syntax;
 pub use interpret::*;
 pub use soft_mask::*;
 pub use types::*;

@@ -14,8 +14,6 @@ mod log;
 mod primitive;
 
 use crate::primitive::{WriteDirect, WriteIndirect};
-use flate2::Compression;
-use flate2::write::ZlibEncoder;
 use beeld_syntax::object::Dict;
 use beeld_syntax::object::Object;
 use beeld_syntax::object::dict::keys::{
@@ -23,6 +21,8 @@ use beeld_syntax::object::dict::keys::{
 };
 use beeld_syntax::object::{MaybeRef, ObjRef};
 use beeld_syntax::page::{Page, Resources, Rotation};
+use flate2::Compression;
+use flate2::write::ZlibEncoder;
 use pdf_writer::{Chunk, Content, Filter, Finish, Name, Rect, Ref};
 use rustc_hash::FxHashMap;
 use std::collections::{BTreeMap, HashSet};

@@ -1,0 +1,4 @@
+*.pdf -text
+*.jp2 -text
+*.ttf -text
+*.icc -text

@@ -20,7 +20,7 @@ members = [
 [workspace.package]
 authors = ["Laurenz Stampfl <laurenz.stampfl@gmail.com>"]
 edition = "2024"
-rust-version = "1.92" # also change in ci.yml
+rust-version = "1.92" # MSRV floor; the dev/CI toolchain is pinned in mise.toml
 repository = "https://git.bloudraad.io/bloudraad/beeld"
 readme = "README.md"
 license = "LicenseRef-Proprietary"

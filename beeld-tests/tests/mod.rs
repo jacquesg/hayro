@@ -1,6 +1,6 @@
 use beeld::beeld_interpret::InterpreterSettings;
-use beeld::beeld_interpret::font::{FontData, FontQuery, StandardFont};
 use beeld::beeld_interpret::beeld_cmap::CidFamily;
+use beeld::beeld_interpret::font::{FontData, FontQuery, StandardFont};
 use beeld_svg::SvgRenderSettings;
 use beeld_syntax::Pdf;
 use beeld_syntax::{DecryptionError, LoadPdfError};

@@ -2,8 +2,8 @@
 
 use std::fs;
 
-use criterion::{Criterion, criterion_group, criterion_main};
 use beeld_jbig2::{DecoderContext, Image};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 struct NullDecoder;
 

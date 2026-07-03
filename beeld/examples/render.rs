@@ -1,8 +1,8 @@
 //! This example shows you how you can render a PDF file to PNG.
 
 use beeld::beeld_interpret::InterpreterSettings;
-use beeld::beeld_interpret::font::{FontData, FontQuery, StandardFont};
 use beeld::beeld_interpret::beeld_cmap::CidFamily;
+use beeld::beeld_interpret::font::{FontData, FontQuery, StandardFont};
 use beeld::beeld_syntax::Pdf;
 use beeld::{RenderCache, RenderSettings, render};
 use std::path::Path;

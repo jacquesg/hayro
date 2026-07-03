@@ -1,0 +1,62 @@
+# beeld engine gate (darwin/arm64). The Linux engine-linux-amd64.yaml runs the full
+# host-invariant gate (fmt/clippy/features/nostd/doc/deny); this runs the tests
+# NATIVELY on the darwin/arm64 agent to catch platform-specific breakage — the
+# darwin half of the old tests-cross-platform job.
+#
+# macOS cannot run containers, so this is the LOCAL backend: `image: bash` only
+# names the shell the agent runs commands with (nothing is pulled); the
+# mise-provisioned `just` recipes run on the host with its toolchain.
+#
+# push only: the clone reuses the forge registry token (basic auth), which is not
+# exposed to pull_request pipelines.
+
+when:
+  - event: [push, manual]
+
+labels:
+  platform: darwin/arm64
+
+# The local backend's built-in clone gets no CI_NETRC (Woodpecker injects that
+# only into entrypoint clone plugins, not command steps), so skip it and clone by
+# hand. A PERSISTENT checkout under the real home keeps cargo's target/ warm
+# across runs — the throwaway per-pipeline workspace embeds its path in cargo
+# fingerprints and would miss the cache every run.
+skip_clone: true
+
+steps:
+  - name: clone
+    image: bash
+    environment:
+      FORGE_USER:
+        from_secret: forge_registry_user
+      FORGE_TOKEN:
+        from_secret: forge_registry_token
+    commands:
+      - |
+        set -e
+        src="$$(eval echo ~"$$(id -un)")/woodpecker-cache/src/$${CI_REPO_NAME:-beeld}"
+        mkdir -p "$$src"
+        git -C "$$src" rev-parse --git-dir >/dev/null 2>&1 || git -C "$$src" init -q
+        git -C "$$src" remote get-url origin >/dev/null 2>&1 || git -C "$$src" remote add origin "$${CI_REPO_CLONE_URL}"
+        export GIT_CONFIG_NOSYSTEM=1
+        hdr="http.extraHeader=Authorization: Basic $$(printf '%s:%s' "$${FORGE_USER}" "$${FORGE_TOKEN}" | base64 | tr -d '\n')"
+        git -C "$$src" -c "$$hdr" fetch --depth 1 origin "$${CI_COMMIT_SHA}" || git -C "$$src" -c "$$hdr" fetch --depth 1 origin "$${CI_COMMIT_REF}"
+        git -C "$$src" reset --hard "$${CI_COMMIT_SHA}"
+
+  - name: engine
+    image: bash
+    environment:
+      # mise's GitHub API calls (tool metadata/version/download) — lift the shared
+      # unauthenticated rate limit.
+      GITHUB_TOKEN:
+        from_secret: github_token
+    commands:
+      # Build from the PERSISTENT checkout, not the throwaway workspace, so cargo's
+      # target/ under ~/woodpecker-cache stays warm. Provision the mise toolchain,
+      # then run the tests (fmt/clippy/doc/deny run once on Linux).
+      - |
+        set -e
+        cd "$$(eval echo ~"$$(id -un)")/woodpecker-cache/src/$${CI_REPO_NAME:-beeld}"
+        mise trust --all
+        mise install
+        just ci-test
