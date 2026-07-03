@@ -2206,9 +2206,9 @@ mod tests {
         // (ISO 32000-1 §7.6.2): for R<=4 each is exactly 32 raw bytes. Before
         // the encrypt-obj bypass, reading them ran the cipher and returned
         // mangled bytes of the wrong length (T2 regression guard).
-        let o = enc.get::<crate::object::String<'_>>(b"O").expect("/O");
+        let o = enc.get::<object::String<'_>>(b"O").expect("/O");
         assert_eq!(o.as_bytes().len(), 32, "AES-128 /O must be 32 raw bytes");
-        let u = enc.get::<crate::object::String<'_>>(b"U").expect("/U");
+        let u = enc.get::<object::String<'_>>(b"U").expect("/U");
         assert_eq!(u.as_bytes().len(), 32, "AES-128 /U must be 32 raw bytes");
     }
 

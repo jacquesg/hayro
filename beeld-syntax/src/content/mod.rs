@@ -174,7 +174,7 @@ impl<'a> UntypedIter<'a> {
                 // similar behavior to Acrobat and Chromium, we try to consume
                 // such an operator and then simply skip it.
                 if let Some(object) = self.reader.read_without_context::<Object<'_>>() {
-                    self.stack.push(object)?;
+                    self.stack.push(object);
                 } else if self.reader.read_without_context::<Operator<'_>>().is_some() {
                     self.stack.clear();
                 } else {
@@ -318,7 +318,7 @@ impl<'a> UntypedIter<'a> {
                                 find_reader.read_byte()?;
                             }
 
-                            self.stack.push(Object::Stream(stream))?;
+                            self.stack.push(Object::Stream(stream));
 
                             self.reader.read_bytes(2)?;
                             self.reader.skip_white_spaces();
@@ -487,15 +487,13 @@ impl<'a> Stack<'a> {
         }
     }
 
-    fn push(&mut self, operand: Object<'a>) -> Option<()> {
-        // Silently drop operands past MAX_OPERANDS: a legitimate instruction
-        // never approaches the cap, and this bounds a malformed operand-only
-        // run without the "halt the whole stream" behaviour that returning
-        // `None` here would trigger at the call site.
+    /// Push an operand, silently dropping any beyond `MAX_OPERANDS`. A
+    /// conformant instruction never approaches the cap; the bound stops a
+    /// malformed operand-only run from growing the stack without limit.
+    fn push(&mut self, operand: Object<'a>) {
         if self.data.len() < MAX_OPERANDS {
             self.data.push(operand);
         }
-        Some(())
     }
 
     fn clear(&mut self) {
@@ -540,11 +538,9 @@ impl Debug for Stack<'_> {
 
 impl Clone for Stack<'_> {
     fn clone(&self) -> Self {
-        let mut stack = Self::new();
-        for item in self.as_slice() {
-            stack.push(item.clone()).unwrap();
+        Self {
+            data: self.data.clone(),
         }
-        stack
     }
 }
 
