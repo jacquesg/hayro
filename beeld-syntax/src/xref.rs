@@ -314,6 +314,7 @@ impl XRef {
             data: Arc::new(Data::new(data)),
             map: Arc::new(RwLock::new(MapRepr { xref_map, repaired })),
             decryptor: Arc::new(Decryptor::None),
+            encrypt_obj: None,
             has_ocgs: false,
             metadata: Arc::new(Metadata::default()),
             trailer_data,
@@ -326,7 +327,7 @@ impl XRef {
         // time to resolve the catalog dictionary, etc. This allows us to support catalog dictionaries
         // that are stored in an encrypted object stream.
 
-        let decryptor = {
+        let (decryptor, encrypt_obj) = {
             match input {
                 XRefInput::TrailerDictData(trailer_dict_data) => {
                     let mut r = Reader::new(trailer_dict_data);
@@ -335,9 +336,15 @@ impl XRef {
                         .read_with_context::<Dict<'_>>(&ReaderContext::new(&xref, false))
                         .ok_or(XRefError::Unknown)?;
 
-                    get_decryptor(&trailer_dict, password)?
+                    // Capture the /Encrypt reference's id (when indirect) so its
+                    // own strings are read undecrypted (ISO 32000-1 §7.6.2).
+                    let encrypt_obj = trailer_dict
+                        .get_ref(ENCRYPT)
+                        .map(|r| ObjectIdentifier::new(r.obj_number, r.gen_number));
+
+                    (get_decryptor(&trailer_dict, password)?, encrypt_obj)
                 }
-                XRefInput::RootRef(_) => Decryptor::None,
+                XRefInput::RootRef(_) => (Decryptor::None, None),
             }
         };
 
@@ -346,6 +353,7 @@ impl XRef {
             Inner::Some(r) => {
                 let mutable = Arc::make_mut(r);
                 mutable.decryptor = Arc::new(decryptor.clone());
+                mutable.encrypt_obj = encrypt_obj;
             }
         }
 
@@ -827,6 +835,11 @@ impl XRef {
             Inner::Dummy => false,
             Inner::Some(r) => {
                 if matches!(r.decryptor.as_ref(), Decryptor::None) {
+                    false
+                } else if r.encrypt_obj.is_some() && ctx.obj_number() == r.encrypt_obj {
+                    // Strings inside the /Encrypt dictionary itself are NOT
+                    // encrypted (ISO 32000-1 §7.6.2); reading /O, /U, /Perms,
+                    // /OE, /UE must not run the cipher.
                     false
                 } else {
                     !ctx.in_content_stream() && !ctx.in_object_stream()
@@ -1365,6 +1378,11 @@ struct SomeRepr {
     map: Arc<RwLock<MapRepr>>,
     metadata: Arc<Metadata>,
     decryptor: Arc<Decryptor>,
+    /// Object id of the `/Encrypt` dictionary when it is an indirect
+    /// reference. Strings inside `/Encrypt` are not themselves encrypted
+    /// (ISO 32000-1 §7.6.2), so string reads keyed to this object must bypass
+    /// the decryptor.
+    encrypt_obj: Option<ObjectIdentifier>,
     has_ocgs: bool,
     password: Vec<u8>,
     trailer_data: TrailerData,
@@ -2183,6 +2201,15 @@ mod tests {
         let enc = pdf.encryption_dict().expect("encryption dict");
         let filter = enc.get::<Name<'_>>(b"Filter").expect("Filter name");
         assert_eq!(filter.deref(), b"Standard");
+
+        // /O and /U inside /Encrypt are NOT themselves encrypted
+        // (ISO 32000-1 §7.6.2): for R<=4 each is exactly 32 raw bytes. Before
+        // the encrypt-obj bypass, reading them ran the cipher and returned
+        // mangled bytes of the wrong length (T2 regression guard).
+        let o = enc.get::<crate::object::String<'_>>(b"O").expect("/O");
+        assert_eq!(o.as_bytes().len(), 32, "AES-128 /O must be 32 raw bytes");
+        let u = enc.get::<crate::object::String<'_>>(b"U").expect("/U");
+        assert_eq!(u.as_bytes().len(), 32, "AES-128 /U must be 32 raw bytes");
     }
 
     #[test]
