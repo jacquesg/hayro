@@ -498,17 +498,17 @@ impl XRef {
         reader.read_with_context::<Dict<'_>>(&ReaderContext::new(self, false))
     }
 
-    /// Return the trailer dictionary pinned by `startxref`.
+    /// Return the trailer of the **base** (oldest) cross-reference section —
+    /// the terminus reached by walking the `/Prev` chain from the
+    /// `startxref`-pinned section until no `/Prev` remains.
     ///
-    /// The result is the trailer of the terminal xref section — the
-    /// section reached by starting at the file's final `startxref`
-    /// offset and walking `/Prev` links until no more remain. For a
-    /// single-section document this is the same dict as
-    /// [`XRef::trailer`]. For a document with multiple sections —
-    /// most notably a linearised document where `startxref` points at
-    /// the first-page xref and `/Prev` reaches the main xref at the
-    /// tail — this returns the dict at the end of the `/Prev` chain,
-    /// which differs from `trailer()`.
+    /// For an incrementally-updated document (ISO 32000-1 §7.5.6) the `/Prev`
+    /// chain runs from the newest revision — which [`XRef::trailer`] returns —
+    /// back to the original, so this returns the **original** document's
+    /// trailer, not the most recent one. For a single-section document it
+    /// equals [`XRef::trailer`]. In a linearised file, where `startxref`
+    /// points at the first-page xref and `/Prev` reaches the main xref at the
+    /// tail, this returns the main (tail) trailer.
     ///
     /// Useful for diagnostics that compare first-page versus
     /// tail-of-file trailer state (e.g. matching `/ID` arrays across
@@ -526,7 +526,7 @@ impl XRef {
     ///
     /// Requires the `inspect` feature.
     #[cfg(feature = "inspect")]
-    pub fn latest_trailer(&self) -> Option<Dict<'_>> {
+    pub fn base_trailer(&self) -> Option<Dict<'_>> {
         let repr = match &self.0 {
             Inner::Dummy => return None,
             Inner::Some(r) => r,

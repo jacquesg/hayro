@@ -394,7 +394,7 @@ mod tests {
     /// Build a minimal PDF that carries two xref sections chained via
     /// `/Prev`. The trailing section (pinned by `startxref`) and the
     /// base section advertise distinct `/ID` arrays so that tests can
-    /// tell `trailer()` from `latest_trailer()`.
+    /// tell `trailer()` from `base_trailer()`.
     #[cfg(feature = "inspect")]
     fn build_incremental_pdf_with_distinct_ids() -> Vec<u8> {
         let catalog = "<< /Type /Catalog /Pages 2 0 R >>";
@@ -435,7 +435,7 @@ mod tests {
 
     #[cfg(feature = "inspect")]
     #[test]
-    fn latest_trailer_returns_terminus_of_prev_chain() {
+    fn base_trailer_returns_terminus_of_prev_chain() {
         use crate::object::Array;
         use crate::object::String as PdfString;
 
@@ -451,9 +451,9 @@ mod tests {
             .expect("update /ID[0]");
         assert_eq!(startxref_id_first.as_ref(), &[0xCC, 0xCC]);
 
-        // latest_trailer() walks /Prev to the terminus (the base
+        // base_trailer() walks /Prev to the terminus (the base
         // section, with /ID = [<AAAA> <BBBB>]).
-        let latest = pdf.latest_trailer().expect("latest trailer");
+        let latest = pdf.base_trailer().expect("latest trailer");
         let latest_id_first = latest
             .get::<Array<'_>>(b"ID")
             .and_then(|a| a.flex_iter().next::<PdfString<'_>>())
@@ -463,11 +463,11 @@ mod tests {
 
     #[cfg(feature = "inspect")]
     #[test]
-    fn latest_trailer_equals_trailer_for_single_section() {
+    fn base_trailer_equals_trailer_for_single_section() {
         let pdf = Pdf::new(build_non_linearized()).expect("pdf loads");
         let a: i32 = pdf.trailer().expect("trailer").get(b"Size").expect("Size");
         let b: i32 = pdf
-            .latest_trailer()
+            .base_trailer()
             .expect("latest trailer")
             .get(b"Size")
             .expect("Size");
@@ -476,7 +476,7 @@ mod tests {
 
     #[cfg(feature = "inspect")]
     #[test]
-    fn latest_trailer_for_linearized_fixture_differs_from_trailer() {
+    fn base_trailer_for_linearized_fixture_differs_from_trailer() {
         let bytes: &[u8] =
             include_bytes!("../../beeld-tests/pdfs/custom/andler-optimal-lot-size_linearized.pdf");
         let pdf = Pdf::new(bytes.to_vec()).expect("linearized fixture loads");
@@ -485,7 +485,7 @@ mod tests {
         // startxref-pinned trailer == first-page trailer for a
         // linearised PDF per Annex F.2.
         let startxref_trailer = pdf.trailer().expect("startxref trailer");
-        let latest = pdf.latest_trailer().expect("latest trailer");
+        let latest = pdf.base_trailer().expect("latest trailer");
 
         // The first-page trailer and the main trailer cover different
         // byte spans, so their raw dict slices must differ.
@@ -498,9 +498,9 @@ mod tests {
 
     #[cfg(feature = "inspect")]
     #[test]
-    fn latest_trailer_on_dummy_xref_is_none() {
+    fn base_trailer_on_dummy_xref_is_none() {
         use crate::xref::XRef;
         let dummy = XRef::dummy();
-        assert!(dummy.latest_trailer().is_none());
+        assert!(dummy.base_trailer().is_none());
     }
 }
