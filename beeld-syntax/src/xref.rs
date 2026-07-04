@@ -302,9 +302,16 @@ impl XRef {
                     _ => None,
                 })
                 .collect();
+            // Push the file-length sentinel BEFORE sorting so the slice is
+            // always sorted. A valid object's offset is < file_len, so the
+            // sentinel becomes the last live object's window bound; a corrupt
+            // offset > file_len sorts after it and is never chosen as a
+            // preceding object's window end - which would otherwise size an
+            // unbounded on-demand read (memory-amplification DoS). See
+            // `next_object_bound`.
+            offsets.push(data.len());
             offsets.sort_unstable();
             offsets.dedup();
-            offsets.push(data.len());
             offsets
         } else {
             Vec::new()
@@ -828,10 +835,54 @@ impl XRef {
             unreachable!();
         };
 
-        let mut locked = r.map.try_put().unwrap();
-        assert!(!locked.repaired);
+        // Take the write lock without racing: a concurrent repair must not
+        // panic. `put` blocks until the lock is free rather than unwrapping a
+        // failed `try_write`, and the `repaired` re-check makes repair
+        // idempotent - a thread that lost the race observes the winner's rebuilt
+        // table and returns instead of asserting or rebuilding twice.
+        // `fallback_xref_map` resolves either through a dummy context (which
+        // locks nothing) or, when the recovered trailer carries `/Encrypt`,
+        // through a freshly-built `XRef` that owns an independent lock; neither
+        // path re-enters the map lock held here, so holding it across the
+        // rebuild cannot deadlock.
+        let mut locked = r.map.put();
+        if locked.repaired {
+            return;
+        }
+
+        // A streamed source too large to materialise cannot be rebuilt:
+        // `fallback_xref_map` scans `PdfData::as_ref`, which refuses past the
+        // whole-file cap and hands back an empty buffer - which scans to an
+        // empty map. Overwriting the good streamed table with that empty map
+        // (and setting `repaired`, which would reroute reads to the same empty
+        // resident view) destroys every object over the single malformed one
+        // that triggered repair. Leave the table and the `repaired` flag
+        // untouched so the streamed hot path keeps serving every well-formed
+        // object. A resident `as_ref` never refuses, so this skips only the
+        // unmaterialisable oversize streamed case; every other repair rebuilds
+        // exactly as before.
+        if !r.data.get().whole_file_fallback_available() {
+            return;
+        }
 
         let (xref_map, _) = fallback_xref_map(r.data.get(), &r.password);
+        // Never commit an empty *streamed* rebuild. `fallback_xref_map` scans
+        // `PdfData::as_ref`; for a streamed source a transient whole-file read
+        // failure makes `StreamedData::full_bytes` yield an uncached empty slice
+        // (S3), which scans to an empty map. Committing it - and setting
+        // `repaired`, which reroutes every read to that empty resident view -
+        // would turn every object into a null read for the document's lifetime
+        // over one transient blip. Decline instead, leaving the good streamed
+        // table and `repaired` false, so the streamed hot path keeps serving and
+        // a later lookup retries the rebuild - mirroring `fallback`, which also
+        // declines when the scan yields nothing. The guard is limited to streamed
+        // sources: a resident `as_ref` never transiently fails, so an empty scan
+        // there is a genuinely objectless file, and committing it (repaired=true)
+        // lets the resident retry in `get_with` terminate via its "still couldn't
+        // be read" path rather than re-triggering repair forever.
+        if r.data.get().is_streamed() && xref_map.is_empty() {
+            return;
+        }
         locked.xref_map = xref_map;
         locked.repaired = true;
     }
@@ -892,12 +943,17 @@ impl XRef {
             return None;
         };
 
-        let entry = {
-            let locked = repr.map.try_get().unwrap();
+        let (entry, repaired) = {
+            // Blocking read: a concurrent `repair` holds the write lock while it
+            // rebuilds the table; wait for it rather than unwrapping a failed
+            // `try_read` (a panic) or observing a spurious "object missing". Read
+            // the `repaired` flag under the same lock so the streamed/resident
+            // routing below sees a consistent snapshot.
+            let locked = repr.map.get();
             // An indirect reference to an undefined object shall not be considered an error by a PDF processor; it
             // shall be treated as a reference to the null object.
             match locked.xref_map.get(&id) {
-                Some(entry) => *entry,
+                Some(entry) => (*entry, locked.repaired),
                 None => return None,
             }
         };
@@ -909,7 +965,12 @@ impl XRef {
         // Streaming source: read only the bytes each object needs, rather
         // than borrowing the whole (non-resident) buffer. The resident path
         // below is byte-for-byte unchanged.
-        if repr.data.get().is_streamed() {
+        //
+        // Once the table has been repaired (a whole-file rebuild), route through
+        // the resident path instead: the repaired offsets and the now-resident
+        // buffer are authoritative, whereas the streamed window bounds were built
+        // from the pre-repair offsets and would miss or truncate repaired objects.
+        if repr.data.get().is_streamed() && !repaired {
             return match entry {
                 EntryType::Free { .. } => None,
                 EntryType::Normal { offset } => {
@@ -919,29 +980,57 @@ impl XRef {
                     // map to file positions.
                     ctx.set_detached(true);
                     let end_bound = repr.next_object_bound(offset);
-                    if let Some(window) = repr.data.object_window(offset as u64, end_bound) {
-                        let mut r = Reader::new(window);
-                        if let Some(object) = r.read_with_context::<IndirectObject<T>>(&ctx) {
-                            if object.id() == &id {
-                                return Some(object.get());
+                    match repr.data.object_window(offset as u64, end_bound) {
+                        Ok(window) => {
+                            let mut r = Reader::new(window);
+                            if let Some(object) = r.read_with_context::<IndirectObject<T>>(&ctx) {
+                                if object.id() == &id {
+                                    return Some(object.get());
+                                }
+                            } else if r.skip::<IndirectObject<Object<'_>>>(false).is_some() {
+                                // Valid object, wrong type - a clean miss.
+                                return None;
                             }
-                        } else if r.skip::<IndirectObject<Object<'_>>>(false).is_some() {
-                            // Valid object, wrong type - a clean miss.
+                            // The window read but did not parse as this object:
+                            // the recorded offset is genuinely wrong. Fall
+                            // through to the repair path below.
+                        }
+                        Err(_) => {
+                            // A transient positioned-read failure on THIS object's
+                            // window - not a parse failure. Resolve just this
+                            // object to the null object (ISO 32000-1 §7.3.10) and
+                            // leave the good streamed table intact, rather than
+                            // escalating one flaky read to a whole-file repair
+                            // (which would discard streaming for every object).
+                            // The failed read was not cached, so a later lookup
+                            // retries it.
                             return None;
                         }
                     }
 
-                    // The object window did not parse; fall back to a
-                    // whole-file repair (which materialises) once.
-                    if self.is_repaired() {
-                        error!(
-                            "attempt was made at repairing xref, but object {id:?} still couldn't be read"
-                        );
-                        None
-                    } else {
+                    // The object window did not parse. Ensure the table is
+                    // repaired - by us, or by a thread that repaired
+                    // concurrently after we snapshotted a now-stale entry - and
+                    // retry only once it is actually in the repaired state: the
+                    // retry then reads the rebuilt offsets and routes to the
+                    // resident path (which resolves the object or returns `None`
+                    // without re-entering this branch), bounding it.
+                    //
+                    // `repair` is a deliberate no-op for a streamed source too
+                    // large to materialise - rebuilding from its refused, empty
+                    // whole-file view would wipe the good streamed table - so it
+                    // leaves `repaired` false. Retrying through this branch would
+                    // then loop forever, so return `None` for this one object: it
+                    // resolves to the null object (ISO 32000-1 §7.3.10) while
+                    // every other object keeps streaming.
+                    if !self.is_repaired() {
                         warn!("broken xref, attempting to repair");
                         self.repair();
+                    }
+                    if self.is_repaired() {
                         self.get_with::<T>(id, &ctx)
+                    } else {
+                        None
                     }
                 }
                 EntryType::Compressed { obj_stream, index } => {
@@ -1087,7 +1176,7 @@ fn find_last_xref_pos_streamed(data: &PdfData, file_len: u64) -> Option<usize> {
 /// Each xref section (the root, plus every `/Prev` and `/XRefStm` it chains
 /// to) is read in its own window at its absolute offset, so incrementally
 /// updated / signed (multi-section) and hybrid files stream too. A single
-/// section larger than [`STREAM_SECTION_WINDOW`], or a malformed xref, returns
+/// section larger than [`STREAM_SECTION_MAX`], or a malformed xref, returns
 /// [`XRefError::Unknown`] so the caller can fall back to a resident parse.
 pub(crate) fn root_xref_streamed(
     data: PdfData,
@@ -1238,7 +1327,12 @@ fn populate_from_xref_table_streamed(
         reader.skip_white_spaces();
 
         let start = header.start;
-        let end = start + header.num_entries;
+        // Mirror the resident path (`populate_from_xref_table`): a subsection
+        // header whose `start + num_entries` overflows `u32` returns `None`,
+        // routing to the resident fallback rather than panicking (debug /
+        // overflow-checks) or wrapping `end` to 0 and silently dropping the
+        // subsection's entries (release).
+        let end = start.checked_add(header.num_entries)?;
 
         for obj_number in start..end {
             let bytes = reader.read_bytes(XREF_ENTRY_LEN)?;
@@ -1408,8 +1502,13 @@ struct SomeRepr {
     /// i.e. the original trailer could not be read.
     trailer_dict_bytes: Option<Arc<[u8]>>,
     /// For a streaming source only: every `Normal` object's byte offset,
-    /// sorted ascending, with the file length appended as a sentinel. Used
-    /// to bound each object's on-demand read at the next object's start -
+    /// sorted ascending, with the file length included as a sentinel and
+    /// sorted in with the offsets (`XRef::new` pushes it *before* the sort,
+    /// not after). Sorting the sentinel in - rather than appending it - keeps
+    /// a corrupt offset greater than the file length ordered after it, so such
+    /// an offset is never chosen as a preceding object's window end (which
+    /// would size an unbounded on-demand read - a memory-amplification `DoS`).
+    /// Used to bound each object's on-demand read at the next object's start -
     /// objects are non-overlapping, so `[offset, next)` contains the whole
     /// object. Empty for a resident source.
     sorted_offsets: Vec<u64>,
@@ -1419,6 +1518,17 @@ impl SomeRepr {
     /// The exclusive end of the byte window for the streamed object at
     /// `offset`: the next `Normal` offset strictly greater than `offset`, or
     /// the file length. See [`SomeRepr::sorted_offsets`].
+    ///
+    /// The bound is the next *live* (effective) object, so in an
+    /// incrementally-updated file (ISO 32000-1 §7.5.6) the window can span
+    /// superseded revisions lying between two live objects. This is a bounded
+    /// over-read, never a correctness issue: the reader stops at the object's
+    /// own `endobj`, decoding exactly the object at `offset` and ignoring the
+    /// trailing superseded bytes. Bounding tighter would need the superseded
+    /// objects' offsets (absent from the resolved table) or an
+    /// `endobj`/indirect-`/Length` scan of the very bytes being sized - a
+    /// chicken-and-egg the cheap next-live-offset upper bound deliberately
+    /// avoids.
     fn next_object_bound(&self, offset: usize) -> u64 {
         let off = offset as u64;
         let idx = self.sorted_offsets.partition_point(|&o| o <= off);
@@ -2668,17 +2778,11 @@ mod tests {
         assert!(read_xref_table_trailer(&mut reader, &ReaderContext::dummy()).is_none());
     }
 
-    /// A shared `/XRefStm` referenced by multiple revision trailers must not
-    /// abort the xref build via the cycle guard. Real-world incremental
-    /// updates routinely re-publish the original revision's `/XRefStm`
-    /// pointer in the new trailer (e.g. signing tools that update `/Prev`
-    /// and `/XRefStm` in lockstep). The first traversal visits the stream
-    /// offset; subsequent visits return `None` from `populate_xref_impl_inner`,
-    /// and that `None` must be ignored — propagating it would force the
-    /// whole `root_xref` call to fail and fall back to a heuristic scan
-    /// that loses the latest revision's overrides.
-    #[test]
-    fn shared_xref_stm_across_revisions_loads_latest_classic_override() {
+    /// Fixture shared by the resident and streamed variants of the shared-
+    /// `/XRefStm` precedence test. Builds a two-revision hybrid file whose two
+    /// trailers reference the *same* `/XRefStm`, and returns the bytes together
+    /// with the offset object 1 must resolve to (revision 2's classic override).
+    fn shared_xref_stm_revisions_fixture() -> (Vec<u8>, usize) {
         let mut pdf: Vec<u8> = Vec::new();
         pdf.extend_from_slice(b"%PDF-1.7\n");
 
@@ -2741,6 +2845,22 @@ mod tests {
             .as_bytes(),
         );
 
+        (pdf, updated_offset)
+    }
+
+    /// A shared `/XRefStm` referenced by multiple revision trailers must not
+    /// abort the xref build via the cycle guard. Real-world incremental
+    /// updates routinely re-publish the original revision's `/XRefStm`
+    /// pointer in the new trailer (e.g. signing tools that update `/Prev`
+    /// and `/XRefStm` in lockstep). The first traversal visits the stream
+    /// offset; subsequent visits return `None` from `populate_xref_impl_inner`,
+    /// and that `None` must be ignored — propagating it would force the
+    /// whole `root_xref` call to fail and fall back to a heuristic scan
+    /// that loses the latest revision's overrides.
+    #[test]
+    fn shared_xref_stm_across_revisions_loads_latest_classic_override() {
+        let (pdf, updated_offset) = shared_xref_stm_revisions_fixture();
+
         let pdf_doc = Pdf::new(pdf).expect("two-revision hybrid loads");
         let entry = pdf_doc
             .xref()
@@ -2756,12 +2876,43 @@ mod tests {
         }
     }
 
-    /// In a hybrid file the classic xref table is the legacy-reader fallback
-    /// and the `/XRefStm` is authoritative for PDF 1.5+ readers
-    /// (PDF 32000-1 § 7.5.8.4). When both reference the same object number,
-    /// the stream's entry must win.
+    /// Streamed counterpart of the resident
+    /// `shared_xref_stm_across_revisions_loads_latest_classic_override`: that
+    /// test opens via `Pdf::new`, which routes a resident `Vec` through
+    /// `root_xref`, so newest-revision-wins is asserted only on the resident
+    /// path. This pins it on the *streamed* path directly.
+    /// `populate_from_xref_table_streamed` recurses into `/Prev` first, then
+    /// applies this section's classic entries (rev 2's override of object 1),
+    /// then follows the shared `/XRefStm` whose re-visit hits the cycle guard
+    /// and is ignored — so rev 2's offset must survive (ISO 32000-1 §7.5.6). A
+    /// resident `PdfData` still drives the streamed parse (it reads via
+    /// `read_range`).
     #[test]
-    fn hybrid_xref_stm_overrides_classic_entries() {
+    fn shared_xref_stm_across_revisions_loads_latest_classic_override_streamed() {
+        let (pdf, updated_offset) = shared_xref_stm_revisions_fixture();
+        let file_len = pdf.len() as u64;
+
+        let xref = root_xref_streamed(PdfData::from(pdf), b"", file_len)
+            .expect("two-revision hybrid loads streamed");
+        let entry = xref
+            .entry(ObjectIdentifier::new(1, 0))
+            .expect("object 1 has an xref entry");
+        match entry {
+            EntryType::Normal { offset } => assert_eq!(
+                offset, updated_offset,
+                "on the streamed path rev 2's classic override must win over rev 1's classic + \
+                 the shared XRefStm (got offset {offset}, expected {updated_offset})"
+            ),
+            other => panic!("expected Normal entry, got {other:?}"),
+        }
+    }
+
+    /// Fixture shared by the resident and streamed variants of the hybrid
+    /// `/XRefStm`-overrides-classic test. Builds a single-revision hybrid file
+    /// whose classic table points object 1 at a "legacy" body and whose
+    /// `/XRefStm` points it at a "new" body, and returns the bytes with the
+    /// offset object 1 must resolve to (the stream's "new" body).
+    fn hybrid_xref_stm_fixture() -> (Vec<u8>, usize) {
         let mut pdf: Vec<u8> = Vec::new();
         pdf.extend_from_slice(b"%PDF-1.7\n");
 
@@ -2815,6 +2966,17 @@ mod tests {
             .as_bytes(),
         );
 
+        (pdf, new_offset)
+    }
+
+    /// In a hybrid file the classic xref table is the legacy-reader fallback
+    /// and the `/XRefStm` is authoritative for PDF 1.5+ readers
+    /// (PDF 32000-1 § 7.5.8.4). When both reference the same object number,
+    /// the stream's entry must win.
+    #[test]
+    fn hybrid_xref_stm_overrides_classic_entries() {
+        let (pdf, new_offset) = hybrid_xref_stm_fixture();
+
         let pdf_doc = Pdf::new(pdf).expect("hybrid pdf loads");
         let entry = pdf_doc
             .xref()
@@ -2828,5 +2990,478 @@ mod tests {
             ),
             other => panic!("expected Normal entry, got {other:?}"),
         }
+    }
+
+    /// Streamed counterpart of the resident
+    /// `hybrid_xref_stm_overrides_classic_entries`: that test opens via
+    /// `Pdf::new` (resident `root_xref`). This pins the same
+    /// `/XRefStm`-over-classic precedence on the *streamed* path, where
+    /// `populate_from_xref_table_streamed` inserts the classic entries first and
+    /// then follows the trailer's `/XRefStm` last, so the stream's entry
+    /// overwrites the classic one (ISO 32000-1 §7.5.8.4). A resident `PdfData`
+    /// still drives the streamed parse (it reads via `read_range`).
+    #[test]
+    fn hybrid_xref_stm_overrides_classic_entries_streamed() {
+        let (pdf, new_offset) = hybrid_xref_stm_fixture();
+        let file_len = pdf.len() as u64;
+
+        let xref = root_xref_streamed(PdfData::from(pdf), b"", file_len)
+            .expect("hybrid pdf loads streamed");
+        let entry = xref
+            .entry(ObjectIdentifier::new(1, 0))
+            .expect("object 1 has an xref entry");
+        match entry {
+            EntryType::Normal { offset } => assert_eq!(
+                offset, new_offset,
+                "on the streamed path the XRefStm entry must override the classic xref for the \
+                 same revision (got offset {offset}, expected {new_offset})"
+            ),
+            other => panic!("expected Normal entry, got {other:?}"),
+        }
+    }
+
+    /// A streamed classic xref table whose subsection header is `4294967295 1`
+    /// (start = `u32::MAX`, `num_entries` = 1) must route to the resident
+    /// fallback, not panic. `size_section_window` sizes the read to
+    /// `num_entries * 20` bytes, so this tiny section reaches the subsection
+    /// loop where `start + num_entries` overflows `u32`. The streamed parser
+    /// must `checked_add` (like the resident `populate_from_xref_table`) and
+    /// return `Err(Unknown)`, rather than panicking under overflow-checks
+    /// (debug / `[profile.fuzz]`) or wrapping `end` to 0 and silently dropping
+    /// the subsection in release.
+    #[test]
+    fn streamed_xref_subsection_start_plus_count_overflow_routes_to_fallback() {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.7\n");
+        let xref_pos = pdf.len();
+        pdf.extend_from_slice(b"xref\n");
+        // Subsection header: start = u32::MAX, num_entries = 1.
+        pdf.extend_from_slice(b"4294967295 1\n");
+        // Exactly one 20-byte entry, so the trailer sits where the parser
+        // expects it and the section fits the initial window.
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        pdf.extend_from_slice(b"trailer\n<< /Size 1 /Root 1 0 R >>\n");
+        pdf.extend_from_slice(format!("startxref\n{xref_pos}\n%%EOF").as_bytes());
+
+        let file_len = pdf.len() as u64;
+        // A resident `PdfData` still exercises the streamed parse (it reads via
+        // `read_range`), so this pins the streamed subsection guard directly.
+        let result = root_xref_streamed(PdfData::from(pdf), b"", file_len);
+        assert!(
+            matches!(result, Err(XRefError::Unknown)),
+            "an overflowing subsection header must return Err(Unknown) to route to the \
+             resident fallback, rather than panicking or silently truncating",
+        );
+    }
+
+    /// A malformed object in an oversize (> 2 GiB) *streamed* document must not
+    /// destroy the whole document. Such a source cannot be materialised for the
+    /// brute-force rebuild (`PdfData::as_ref` refuses past `FULL_FALLBACK_MAX`
+    /// and yields an empty buffer, which scans to an empty map). Before the fix,
+    /// `repair` overwrote the good streamed table with that empty map and set
+    /// `repaired`, so a single malformed object turned every well-formed object
+    /// into a null read. `repair` must instead skip the impossible rebuild,
+    /// leaving the streamed table intact; the one malformed object resolves to
+    /// the null object (ISO 32000-1 §7.3.10) while the rest keep streaming.
+    ///
+    /// The document is synthesised virtually: the source reports a length just
+    /// past 2 GiB (so the whole-file fallback is refused) while serving only a
+    /// few hundred real bytes, so the test allocates nothing like 2 GiB.
+    /// `startxref` is pinned to `i32::MAX` so the streamed open (which reads it
+    /// as `i32`) succeeds - the narrow window in which the defect is reachable.
+    #[test]
+    fn oversize_streamed_repair_preserves_good_objects() {
+        use crate::read_at::{ReadAt, ReadAtError};
+
+        // Build the body in local coordinates, recording each object's local
+        // offset. Object 3 is a well-formed dict (the "good" target); object 4
+        // is deliberate garbage (no `N G obj` header) so its window fails to
+        // parse and triggers `repair`.
+        let mut content: Vec<u8> = Vec::new();
+        content.extend_from_slice(b"%PDF-1.7\n");
+        let bodies: [&[u8]; 4] = [
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+            b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n",
+            b"3 0 obj\n<< /Good 1 >>\nendobj\n",
+            b"garbage-not-an-object\n",
+        ];
+        let mut locs: Vec<usize> = Vec::with_capacity(bodies.len());
+        for body in bodies {
+            locs.push(content.len());
+            content.extend_from_slice(body);
+        }
+
+        let xref_local = content.len();
+        // Pin `startxref` (= base + xref_local) to exactly `i32::MAX` so the
+        // streamed open parses it, while `file_len` (= base + content.len())
+        // lands just past `FULL_FALLBACK_MAX` (the xref section is > 1 byte).
+        let base = i32::MAX as u64 - xref_local as u64;
+
+        let n = bodies.len();
+        let mut xref = format!("xref\n0 {}\n0000000000 65535 f \n", n + 1);
+        for &loc in &locs {
+            xref.push_str(&format!("{:010} 00000 n \n", base + loc as u64));
+        }
+        let startxref = base + xref_local as u64;
+        xref.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n",
+            n + 1
+        ));
+        content.extend_from_slice(xref.as_bytes());
+        let file_len = base + content.len() as u64;
+
+        assert_eq!(startxref, i32::MAX as u64, "startxref must fit i32 to open");
+
+        /// Serves `content` at virtual offsets `[base, base + content.len())`
+        /// and whitespace before `base`, reporting a length just past 2 GiB
+        /// without allocating it.
+        struct VirtualTail {
+            content: Vec<u8>,
+            base: u64,
+            len: u64,
+        }
+        impl ReadAt for VirtualTail {
+            fn len(&self) -> u64 {
+                self.len
+            }
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, ReadAtError> {
+                if offset >= self.len {
+                    return Ok(0);
+                }
+                let n =
+                    usize::try_from((self.len - offset).min(buf.len() as u64)).unwrap_or(buf.len());
+                for (i, b) in buf[..n].iter_mut().enumerate() {
+                    let pos = offset + i as u64;
+                    *b = if pos >= self.base {
+                        self.content
+                            .get((pos - self.base) as usize)
+                            .copied()
+                            .unwrap_or(b' ')
+                    } else {
+                        b' '
+                    };
+                }
+                Ok(n)
+            }
+        }
+
+        let data = PdfData::streamed(VirtualTail {
+            content,
+            base,
+            len: file_len,
+        });
+        assert!(
+            !data.whole_file_fallback_available(),
+            "precondition: the source must exceed the whole-file cap so repair is impossible",
+        );
+
+        let xref = root_xref_streamed(data, b"", file_len).expect("oversize streamed pdf opens");
+
+        let good = ObjectIdentifier::new(3, 0);
+        let bad = ObjectIdentifier::new(4, 0);
+
+        // Baseline: the good object reads before anything triggers repair.
+        assert!(
+            xref.get::<Dict<'_>>(good).is_some(),
+            "well-formed object must read before repair is triggered",
+        );
+
+        // The malformed object triggers repair; on an oversize streamed source
+        // repair is a no-op, so this resolves to the null object (`None`)
+        // without wiping the table or looping.
+        assert!(
+            xref.get::<Dict<'_>>(bad).is_none(),
+            "malformed object must resolve to null, not succeed",
+        );
+        assert!(
+            !xref.is_repaired(),
+            "repair must be skipped (not marked repaired) for an unmaterialisable source",
+        );
+
+        // The regression guard: the good object must STILL read. Before the fix
+        // repair had wiped the whole table to empty and every object became a
+        // null read.
+        assert!(
+            xref.get::<Dict<'_>>(good).is_some(),
+            "a single malformed object must not destroy the rest of the document",
+        );
+    }
+
+    /// The three well-formed objects (catalog, pages, a standalone `<< /Good 1 >>`
+    /// as object 3) shared by the two streamed-repair regression tests below.
+    /// Returns the bytes, each object's offset, and the total length.
+    fn streamed_repair_fixture(pad_to: usize) -> (Vec<u8>, Vec<usize>, u64) {
+        let mut content: Vec<u8> = Vec::new();
+        content.extend_from_slice(b"%PDF-1.7\n");
+        let bodies: [&[u8]; 3] = [
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+            b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n",
+            b"3 0 obj\n<< /Good 1 >>\nendobj\n",
+        ];
+        let mut locs: Vec<usize> = Vec::with_capacity(bodies.len());
+        for body in bodies {
+            locs.push(content.len());
+            content.extend_from_slice(body);
+        }
+        // Optional comment padding (skipped by every parse path) so the caller
+        // can push `file_len` past the tail-scan window.
+        if content.len() < pad_to {
+            content.push(b'%');
+            content.resize(pad_to, b'p');
+            content.push(b'\n');
+        }
+
+        let xref_local = content.len();
+        let mut xref = format!("xref\n0 {}\n0000000000 65535 f \n", bodies.len() + 1);
+        for &loc in &locs {
+            xref.push_str(&format!("{loc:010} 00000 n \n"));
+        }
+        xref.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_local}\n%%EOF\n",
+            bodies.len() + 1
+        ));
+        content.extend_from_slice(xref.as_bytes());
+        let file_len = content.len() as u64;
+        (content, locs, file_len)
+    }
+
+    /// S3 (transient object read): a *transient* positioned-read failure on one
+    /// object's window must resolve just THAT object to the null object
+    /// (ISO 32000-1 §7.3.10) - NOT escalate to a whole-file repair. `object_window`
+    /// returns `Err` (distinct from a successfully-read window that fails to
+    /// parse), so `get_with` returns `None` for the object and leaves the table
+    /// streamed and unrepaired; the failed read is uncached, so a retry resolves
+    /// it. Before the fix a `None` window was indistinguishable from a parse
+    /// failure, so one flaky read forced a whole-file materialise + `repaired`,
+    /// permanently discarding streaming for the entire document.
+    #[test]
+    fn streamed_transient_object_read_does_not_trigger_repair() {
+        use crate::read_at::{ReadAt, ReadAtError};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (content, locs, file_len) = streamed_repair_fixture(0);
+        let off3 = locs[2];
+
+        /// Serves `content`, but fails the read that starts at object 3's offset
+        /// (its on-demand window) exactly once, then succeeds.
+        struct FailObjectReadOnce {
+            content: Vec<u8>,
+            off3: u64,
+            armed: AtomicBool,
+        }
+        impl ReadAt for FailObjectReadOnce {
+            fn len(&self) -> u64 {
+                self.content.len() as u64
+            }
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, ReadAtError> {
+                let start = usize::try_from(offset)
+                    .unwrap_or(usize::MAX)
+                    .min(self.content.len());
+                let n = (self.content.len() - start).min(buf.len());
+                buf[..n].copy_from_slice(&self.content[start..start + n]);
+                Ok(n)
+            }
+            fn read_range(&self, offset: u64, len: usize) -> Result<Vec<u8>, ReadAtError> {
+                if offset == self.off3 && self.armed.swap(false, Ordering::SeqCst) {
+                    return Err(ReadAtError::Io);
+                }
+                let start = usize::try_from(offset)
+                    .unwrap_or(usize::MAX)
+                    .min(self.content.len());
+                let end = start.saturating_add(len).min(self.content.len());
+                Ok(self.content[start..end].to_vec())
+            }
+        }
+
+        let data = PdfData::streamed(FailObjectReadOnce {
+            content,
+            off3: off3 as u64,
+            armed: AtomicBool::new(true),
+        });
+        let xref = root_xref_streamed(data, b"", file_len).expect("fixture opens streamed");
+        let good = ObjectIdentifier::new(3, 0);
+
+        // First lookup: the window read fails transiently -> null for THIS
+        // object, and crucially NO repair (the table stays streamed).
+        assert!(
+            xref.get::<Dict<'_>>(good).is_none(),
+            "a transient window read must resolve the object to null for this lookup",
+        );
+        assert!(
+            !xref.is_repaired(),
+            "a transient window read must NOT escalate one flaky read to a whole-file repair",
+        );
+
+        // Second lookup: the blip has cleared and the read was never cached, so
+        // the same object now resolves.
+        assert_eq!(
+            xref.get::<Dict<'_>>(good)
+                .and_then(|d| d.get::<i32>(b"Good")),
+            Some(1),
+            "the failed read was not cached; a retry must resolve the object",
+        );
+    }
+
+    /// S1 (transient repair): a streamed whole-file read that fails *transiently*
+    /// at repair time must NOT poison the document. `fallback_xref_map` scans
+    /// `PdfData::as_ref`, which yields an uncached empty slice on that I/O error
+    /// (S3); scanning it produces an empty map. `repair` must DECLINE to commit
+    /// that empty rebuild - leaving the good streamed table and `repaired` false -
+    /// so every well-formed object keeps resolving and a later retry (once the
+    /// blip clears) rebuilds for real. Before the fix `repair` committed the empty
+    /// map and set `repaired`, routing every object to a null read for the
+    /// document's lifetime over one transient blip.
+    ///
+    /// The body is padded past 1 KiB so the streamed open's tail scan reads
+    /// `[file_len - 1024, file_len)`, not `[0, file_len)`, leaving the whole-file
+    /// read `[0, file_len)` unique to repair's rebuild.
+    #[test]
+    fn streamed_transient_whole_file_failure_does_not_poison_repair() {
+        use crate::read_at::{ReadAt, ReadAtError};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (content, _locs, file_len) = streamed_repair_fixture(1200);
+
+        /// Serves `content`, but fails the whole-file materialisation read
+        /// (`[0, file_len)`, the only read spanning the whole file) exactly once.
+        struct FailWholeFileOnce {
+            content: Vec<u8>,
+            armed: AtomicBool,
+        }
+        impl ReadAt for FailWholeFileOnce {
+            fn len(&self) -> u64 {
+                self.content.len() as u64
+            }
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, ReadAtError> {
+                let start = usize::try_from(offset)
+                    .unwrap_or(usize::MAX)
+                    .min(self.content.len());
+                let n = (self.content.len() - start).min(buf.len());
+                buf[..n].copy_from_slice(&self.content[start..start + n]);
+                Ok(n)
+            }
+            fn read_range(&self, offset: u64, len: usize) -> Result<Vec<u8>, ReadAtError> {
+                if offset == 0
+                    && len as u64 == self.len()
+                    && self.armed.swap(false, Ordering::SeqCst)
+                {
+                    return Err(ReadAtError::Io);
+                }
+                let start = usize::try_from(offset)
+                    .unwrap_or(usize::MAX)
+                    .min(self.content.len());
+                let end = start.saturating_add(len).min(self.content.len());
+                Ok(self.content[start..end].to_vec())
+            }
+        }
+
+        let data = PdfData::streamed(FailWholeFileOnce {
+            content,
+            armed: AtomicBool::new(true),
+        });
+        assert!(
+            data.whole_file_fallback_available(),
+            "precondition: the source is within the cap, so repair's rebuild is possible",
+        );
+
+        let xref = root_xref_streamed(data, b"", file_len).expect("padded streamed pdf opens");
+        let good = ObjectIdentifier::new(3, 0);
+
+        // Baseline: the good object reads via the streamed table.
+        assert!(
+            xref.get::<Dict<'_>>(good).is_some(),
+            "well-formed object must read before any repair",
+        );
+
+        // First repair hits the transient whole-file failure -> empty scan. The
+        // fix must decline it: the streamed table survives and `repaired` stays
+        // false, so a retry is still possible.
+        xref.repair();
+        assert!(
+            !xref.is_repaired(),
+            "a transient empty rebuild must not be committed as repaired",
+        );
+        assert!(
+            xref.get::<Dict<'_>>(good).is_some(),
+            "the good streamed table must survive a declined (empty) repair",
+        );
+
+        // Second repair: the blip has cleared, the whole-file read succeeds, and
+        // the rebuild scans real objects -> a non-empty map is committed.
+        xref.repair();
+        assert!(
+            xref.is_repaired(),
+            "once the whole-file read succeeds, the real rebuild commits",
+        );
+        assert!(
+            xref.get::<Dict<'_>>(good).is_some(),
+            "the good object still resolves after a real rebuild",
+        );
+    }
+
+    /// A streamed, *encrypted* source repaired in place must not deadlock.
+    /// `repair` holds the map write lock across the brute-force rebuild
+    /// (`fallback_xref_map`); when the recovered trailer carries `/Encrypt`
+    /// that rebuild re-resolves through a freshly-built `XRef` with its OWN
+    /// independent lock (so encrypted object streams decrypt, ISO 32000-1
+    /// §7.6), never the lock held here. Were it to re-enter the held lock this
+    /// test would hang, so simply reaching the post-`repair` assertions pins
+    /// the deadlock-freedom the safety comment claims; the commit and resolve
+    /// pin that the encrypted rebuild actually ran rather than being skipped.
+    #[test]
+    fn encrypted_streamed_repair_does_not_deadlock_and_commits() {
+        use crate::read_at::{ReadAt, ReadAtError};
+
+        /// Minimal positioned-read source over in-memory bytes.
+        struct Bytes(Vec<u8>);
+        impl ReadAt for Bytes {
+            fn len(&self) -> u64 {
+                self.0.len() as u64
+            }
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, ReadAtError> {
+                let start = usize::try_from(offset)
+                    .unwrap_or(usize::MAX)
+                    .min(self.0.len());
+                let n = (self.0.len() - start).min(buf.len());
+                buf[..n].copy_from_slice(&self.0[start..start + n]);
+                Ok(n)
+            }
+            fn read_range(&self, offset: u64, len: usize) -> Result<Vec<u8>, ReadAtError> {
+                let start = usize::try_from(offset)
+                    .unwrap_or(usize::MAX)
+                    .min(self.0.len());
+                let end = start.saturating_add(len).min(self.0.len());
+                Ok(self.0[start..end].to_vec())
+            }
+        }
+
+        // A committed AES-128 fixture (empty user password): a classic `xref` +
+        // `trailer << ... /Encrypt 7 0 R >>`, so the brute-force scan finds the
+        // encrypted trailer and enters the fresh-`XRef` rebuild branch.
+        let bytes: &[u8] = include_bytes!("../../beeld-tests/pdfs/custom/encrypted_aes_128.pdf");
+        let file_len = bytes.len() as u64;
+        let data = PdfData::streamed(Bytes(bytes.to_vec()));
+        assert!(
+            data.whole_file_fallback_available(),
+            "precondition: the fixture is within the cap, so repair can rebuild",
+        );
+
+        let xref = root_xref_streamed(data, b"", file_len).expect("aes-128 fixture opens streamed");
+        assert!(
+            xref.is_encrypted(),
+            "precondition: the fixture must be encrypted to exercise the /Encrypt branch",
+        );
+
+        // Force the rebuild. Reaching the next statement proves the held write
+        // lock was never re-entered by the encrypted re-scan (no deadlock).
+        xref.repair();
+        assert!(
+            xref.is_repaired(),
+            "an in-cap encrypted streamed source must rebuild and commit",
+        );
+        assert!(
+            xref.get::<Dict<'_>>(ObjectIdentifier::new(1, 0)).is_some(),
+            "the catalog must still resolve through the rebuilt encrypted table",
+        );
     }
 }
