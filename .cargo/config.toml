@@ -1,0 +1,7 @@
+# cargo's built-in libgit2 SSH transport does not negotiate the `git` username
+# against the ssh-agent the way the git CLI does, so fetching the private
+# git.bloudraad.io svgraster fork fails with "no authentication methods
+# succeeded". Shell out to the git CLI, which honours the developer's SSH config
+# + agent (and matches how CI authenticates). Same rationale as the sdk repo.
+[net]
+git-fetch-with-cli = true
