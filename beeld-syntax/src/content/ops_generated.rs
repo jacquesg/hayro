@@ -236,7 +236,7 @@ op1!(XObject<'b, 'a>, "Do");
 
 /// Operator `BI` — begin inline image.
 ///
-/// The wrapped `&'b Stream<'a>` carries the image as a self-contained stream: use [`Stream::dict`] for the inline dictionary (width, height, colour space, bits-per-component, filter chain) and [`Stream::raw_data`] for the raw body bytes between the `ID` and `EI` markers. [`Stream::decoded`] runs the declared filter chain.
+/// The wrapped `&'b Stream<'a>` carries the image as a self-contained stream: use [`Stream::dict`] for the inline dictionary (width, height, colour space, bits-per-component, filter chain) and [`Stream::raw_data`] for the raw body bytes between `ID` and `EI`. The optional white-space delimiting the data from `EI` (ISO 32000-2 §8.9.7 NOTE 2) is not trimmed, so the bytes may carry one trailing delimiter byte beyond the image payload; filters and image decoders consume only what they need. [`Stream::decoded`] runs the declared filter chain.
 ///
 /// Inline image dictionaries use abbreviated keys per ISO 32000-1 §8.9.7.1 — e.g. `/W`, `/H`, `/CS`, `/BPC`, `/F`, `/DP`, `/D`, `/IM`, `/I`. Callers should not expand the abbreviations before reading entries.
 ///
@@ -429,7 +429,7 @@ pub enum TypedInstruction<'b, 'a> {
     XObject(XObject<'b, 'a>),
     /// Operator `BI` — begin inline image.
     ///
-    /// The wrapped `&'b Stream<'a>` carries the image as a self-contained stream: use [`Stream::dict`] for the inline dictionary (width, height, colour space, bits-per-component, filter chain) and [`Stream::raw_data`] for the raw body bytes between the `ID` and `EI` markers. [`Stream::decoded`] runs the declared filter chain.
+    /// The wrapped `&'b Stream<'a>` carries the image as a self-contained stream: use [`Stream::dict`] for the inline dictionary (width, height, colour space, bits-per-component, filter chain) and [`Stream::raw_data`] for the raw body bytes between `ID` and `EI`. The optional white-space delimiting the data from `EI` (ISO 32000-2 §8.9.7 NOTE 2) is not trimmed, so the bytes may carry one trailing delimiter byte beyond the image payload; filters and image decoders consume only what they need. [`Stream::decoded`] runs the declared filter chain.
     ///
     /// Inline image dictionaries use abbreviated keys per ISO 32000-1 §8.9.7.1 — e.g. `/W`, `/H`, `/CS`, `/BPC`, `/F`, `/DP`, `/D`, `/IM`, `/I`. Callers should not expand the abbreviations before reading entries.
     ///
