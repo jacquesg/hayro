@@ -1,5 +1,5 @@
 /*!
-A crate for converting PDF pages into either `XObjects` or a new page via [`pdf-writer`](https://docs.rs/pdf-writer/).
+A crate for converting PDF pages into either `XObjects` or a new page via [`henog`](https://git.bloudraad.io/bloudraad/henog).
 
 This is an internal crate and not meant for external use. Therefore, it's not very
 well-documented.
@@ -23,7 +23,7 @@ use beeld_syntax::object::{MaybeRef, ObjRef};
 use beeld_syntax::page::{Page, Resources, Rotation};
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
-use pdf_writer::{Chunk, Content, Filter, Finish, Name, Rect, Ref};
+use henog::{Chunk, Content, Filter, Finish, Name, Rect, Ref};
 use rustc_hash::FxHashMap;
 use std::collections::{BTreeMap, HashSet};
 use std::ops::Deref;
@@ -31,7 +31,7 @@ use std::ops::DerefMut;
 
 pub use beeld_syntax;
 use beeld_syntax::Pdf;
-pub use pdf_writer::Settings as ChunkSettings;
+pub use henog::Settings as ChunkSettings;
 
 /// Apply the extraction queries to the given PDF and return the results.
 pub fn extract<'a, G>(
@@ -42,7 +42,7 @@ pub fn extract<'a, G>(
     queries: &[ExtractionQuery],
 ) -> Result<ExtractionResult, ExtractionError>
 where
-    G: for<'b> FnMut(&mut pdf_writer::writers::Group<'b>),
+    G: for<'b> FnMut(&mut henog::writers::Group<'b>),
 {
     let pages = pdf.pages();
     let mut ctx = ExtractionContext::new(new_ref, pdf, chunk_settings);
@@ -209,7 +209,7 @@ fn write_dependencies(pdf: &Pdf, ctx: &mut ExtractionContext<'_>) {
 /// used directly and only exists for test purposes.
 #[doc(hidden)]
 pub fn extract_pages_to_pdf(beeld_pdf: &Pdf, page_indices: &[usize]) -> Vec<u8> {
-    let mut pdf = pdf_writer::Pdf::new();
+    let mut pdf = henog::Pdf::new();
     let mut next_ref = Ref::new(1);
     let requests = page_indices
         .iter()
@@ -247,7 +247,7 @@ pub fn extract_pages_as_xobject_to_pdf(beeld_pdf: &Pdf, page_indices: &[usize]) 
     let beeld_pages = beeld_pdf.pages();
     let page_list = beeld_pages.as_ref();
 
-    let mut pdf = pdf_writer::Pdf::new();
+    let mut pdf = henog::Pdf::new();
     let mut next_ref = Ref::new(1);
 
     let catalog_id = next_ref.bump();
@@ -374,7 +374,7 @@ fn write_xobject<G>(
     ctx: &mut ExtractionContext<'_>,
 ) -> Result<(), ExtractionError>
 where
-    G: for<'b> FnMut(&mut pdf_writer::writers::Group<'b>),
+    G: for<'b> FnMut(&mut henog::writers::Group<'b>),
 {
     let mut chunk = Chunk::with_settings(ctx.chunk_settings);
     let encoded_stream = deflate_encode(page.page_stream().unwrap_or(b""));
@@ -501,17 +501,17 @@ fn convert_rect(hy_rect: &beeld_syntax::object::Rect) -> Rect {
 }
 
 trait ResourcesExt {
-    fn resources(&mut self) -> pdf_writer::writers::Resources<'_>;
+    fn resources(&mut self) -> henog::writers::Resources<'_>;
 }
 
-impl ResourcesExt for pdf_writer::writers::Page<'_> {
-    fn resources(&mut self) -> pdf_writer::writers::Resources<'_> {
+impl ResourcesExt for henog::writers::Page<'_> {
+    fn resources(&mut self) -> henog::writers::Resources<'_> {
         Self::resources(self)
     }
 }
 
-impl ResourcesExt for pdf_writer::writers::FormXObject<'_> {
-    fn resources(&mut self) -> pdf_writer::writers::Resources<'_> {
+impl ResourcesExt for henog::writers::FormXObject<'_> {
+    fn resources(&mut self) -> henog::writers::Resources<'_> {
         Self::resources(self)
     }
 }

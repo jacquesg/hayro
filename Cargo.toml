@@ -52,7 +52,7 @@ siphasher = "1"
 skrifa = { version = "0.42.0" }
 smallvec = { version = "1" }
 yoke = { version = "0.8" }
-pdf-writer = { version = "0.15.0" }
+henog = { git = "ssh://git@git.bloudraad.io/bloudraad/henog.git", branch = "main" }
 sitro = { git = "https://github.com/LaurenzV/sitro", rev="fb804b3" }
 xmlwriter = { version = "0.1" }
 base64 = { version = "0.22" }

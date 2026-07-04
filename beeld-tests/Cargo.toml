@@ -26,7 +26,7 @@ beeld-svg = { workspace = true }
 beeld-syntax = { workspace = true, features = ["std", "unsafe"] }
 beeld-jbig2 = { workspace = true }
 beeld-jpeg2000 = { workspace = true, features = ["image"] }
-pdf-writer = { workspace = true }
+henog = { workspace = true }
 image = { workspace = true, default-features = false}
 svgraster = { workspace = true }
 walkdir = "2"

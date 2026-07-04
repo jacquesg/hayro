@@ -3,7 +3,7 @@ use beeld_syntax::Pdf;
 use beeld_syntax::object::Stream;
 use beeld_syntax::object::dict::keys::GROUP;
 use beeld_write::ExtractionQuery;
-use pdf_writer::Ref;
+use henog::Ref;
 use sitro::Renderer;
 
 #[test]

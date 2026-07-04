@@ -48,4 +48,6 @@ allow-git = [
   "https://github.com/linebender/vello",
   # beeld's hard fork of resvg/usvg (renamed svgraster/svgir), tracked on main.
   "ssh://git@git.bloudraad.io/bloudraad/svgraster.git",
+  # beeld's hard fork of pdf-writer (renamed henog), tracked on main.
+  "ssh://git@git.bloudraad.io/bloudraad/henog.git",
 ]

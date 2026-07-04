@@ -12,7 +12,7 @@ publish.workspace = true
 
 [dependencies]
 beeld-syntax = { workspace = true, features = ["std"] }
-pdf-writer = { workspace = true }
+henog = { workspace = true }
 flate2 = { workspace = true }
 rustc-hash = { workspace = true }
 log = { workspace = true, optional = true }

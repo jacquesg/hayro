@@ -6,7 +6,7 @@ use beeld_syntax::object::dict::keys::{
 };
 use beeld_syntax::object::{MaybeRef, Null, Number, ObjectIdentifier, Stream};
 use beeld_syntax::object::{Object, array, dict};
-use pdf_writer::{Chunk, Dict, Obj, Ref};
+use henog::{Chunk, Dict, Obj, Ref};
 use std::collections::HashSet;
 use std::ops::Deref;
 use std::ops::DerefMut;
@@ -48,7 +48,7 @@ impl WriteDirect for object::ObjRef {
             let mapped_ref = ctx.map_ref(*self);
             obj.primitive(mapped_ref);
         } else {
-            obj.primitive(pdf_writer::Null);
+            obj.primitive(henog::Null);
         }
     }
 }
@@ -73,19 +73,19 @@ impl WriteDirect for bool {
 
 impl WriteDirect for Null {
     fn write_direct(&self, obj: Obj<'_>, _: &mut ExtractionContext<'_>) {
-        obj.primitive(pdf_writer::Null);
+        obj.primitive(henog::Null);
     }
 }
 
 impl WriteDirect for object::String<'_> {
     fn write_direct(&self, obj: Obj<'_>, _: &mut ExtractionContext<'_>) {
-        obj.primitive(pdf_writer::Str(self.as_ref()));
+        obj.primitive(henog::Str(self.as_ref()));
     }
 }
 
 impl WriteDirect for object::Name<'_> {
     fn write_direct(&self, obj: Obj<'_>, _: &mut ExtractionContext<'_>) {
-        obj.primitive(pdf_writer::Name(self.deref()));
+        obj.primitive(henog::Name(self.deref()));
     }
 }
 
@@ -120,7 +120,7 @@ fn write_dict(
         }
 
         if !IGNORE_KEYS.contains(name.deref()) {
-            val.write_direct(pdf_dict.insert(pdf_writer::Name(name.deref())), ctx);
+            val.write_direct(pdf_dict.insert(henog::Name(name.deref())), ctx);
         }
     }
 }
