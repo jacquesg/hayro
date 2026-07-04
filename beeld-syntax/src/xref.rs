@@ -487,7 +487,8 @@ impl XRef {
     /// Returns `None` for non-linearized documents, for dummy xrefs, or
     /// when the first-page trailer cannot be located. The first-page
     /// trailer is the dict immediately preceding the first `%%EOF`
-    /// marker in the file (ISO 32000-1 Annex F.4.5).
+    /// marker in the file (ISO 32000-2 Annex F.3.4, "First-page
+    /// cross-reference table and trailer").
     ///
     /// Requires the `inspect` feature because it uses `FileLayout`
     /// EOF offsets.
@@ -565,9 +566,19 @@ impl XRef {
                 let stream = reader
                     .read_with_context::<IndirectObject<Stream<'_>>>(&ctx)?
                     .get();
-                // The stream dict is the trailer for an xref stream
-                // (§7.5.8.1). Clone to detach from the local IndirectObject.
-                Some(stream.dict().clone())
+                // The xref stream's own dict is the trailer for that section
+                // (ISO 32000-1 §7.5.8.1). Reading it as an indirect object
+                // above set that object's number on `ctx`, which would run the
+                // cipher over its strings on access - but §7.5.8.2 requires the
+                // cross-reference stream dictionary's strings to be unencrypted.
+                // Re-parse the dict from its own bytes under a detached,
+                // object-number-less context so no decryption runs, matching
+                // the `Table` arm above and `trailer()` (both read the trailer
+                // dict with no object number set).
+                let mut dict_reader = Reader::new(stream.dict().data());
+                let mut dict_ctx = ReaderContext::new(self, false);
+                dict_ctx.set_detached(true);
+                dict_reader.read_with_context::<Dict<'_>>(&dict_ctx)
             }
         }
     }
@@ -743,12 +754,64 @@ impl XRef {
         }
     }
 
+    /// Return the state of the document's `/Encrypt` trailer entry.
+    ///
+    /// Resolves the three cases the `Option` from [`XRef::encryption_dict`]
+    /// cannot tell apart:
+    ///
+    /// - [`Absent`](EncryptionKind::Absent) — no `/Encrypt` entry, or a
+    ///   `null` one (ISO 32000-1 §7.3.7 treats a null value the same as an
+    ///   omitted entry): a plaintext document (ISO 32000-1 §7.6.2: absence
+    ///   of the entry means the document shall be considered not encrypted).
+    /// - [`Malformed`](EncryptionKind::Malformed) — `/Encrypt` is present in
+    ///   the trailer but does not resolve to a dictionary (e.g. a dangling
+    ///   indirect reference or a non-dictionary value).
+    /// - [`Encrypted`](EncryptionKind::Encrypted) — `/Encrypt` resolved to an
+    ///   encryption dictionary.
+    ///
+    /// Reports `Absent` for dummy xrefs and for xrefs reconstructed from a
+    /// fallback root reference (where the original trailer is unavailable).
+    /// Like [`XRef::encryption_dict`], it reflects only the trailer's
+    /// `/Encrypt` entry and is independent of whether decryption succeeded:
+    /// a document opened via [`Pdf::new_with_password`] still reports
+    /// `Encrypted`.
+    ///
+    /// # Performance
+    ///
+    /// Re-parses the trailer on each call. See [`XRef::trailer`] for the
+    /// same binding guidance.
+    ///
+    /// [`Pdf::new_with_password`]: crate::Pdf::new_with_password
+    pub fn encryption_kind(&self) -> EncryptionKind<'_> {
+        let Some(trailer) = self.trailer() else {
+            return EncryptionKind::Absent;
+        };
+        // `contains_key` cannot gate presence here: the dict parser retains
+        // null-valued keys in its offsets map (so an object stream is not
+        // read before the encryption dict is resolved), so it reports an
+        // `/Encrypt null` entry as present. A null value is spec-equivalent
+        // to an omitted entry (ISO 32000-1 §7.3.7 — a dictionary entry whose
+        // value is null shall be treated the same as if the entry does not
+        // exist), so inspect the raw value: treat absent-or-null as Absent,
+        // reserving Malformed for a present, non-null value that does not
+        // resolve to a dictionary.
+        match trailer.get_raw::<Object<'_>>(ENCRYPT) {
+            None | Some(MaybeRef::NotRef(Object::Null(_))) => EncryptionKind::Absent,
+            Some(_) => match trailer.get::<Dict<'_>>(ENCRYPT) {
+                Some(dict) => EncryptionKind::Encrypted { dict },
+                None => EncryptionKind::Malformed,
+            },
+        }
+    }
+
     /// Return the document's encryption dictionary, if any.
     ///
     /// Resolves the trailer's `/Encrypt` entry, following an indirect
     /// reference where needed. Returns `None` for unencrypted documents,
-    /// for dummy xrefs, and for xrefs reconstructed from a fallback root
-    /// reference (where the original trailer is unavailable).
+    /// for a present-but-malformed `/Encrypt` (use [`XRef::encryption_kind`]
+    /// to tell those two apart), for dummy xrefs, and for xrefs
+    /// reconstructed from a fallback root reference (where the original
+    /// trailer is unavailable).
     ///
     /// The accessor reports the presence of `/Encrypt` in the trailer and
     /// is independent of whether decryption succeeded: a document loaded
@@ -762,12 +825,17 @@ impl XRef {
     ///
     /// [`Pdf::new_with_password`]: crate::Pdf::new_with_password
     pub fn encryption_dict(&self) -> Option<Dict<'_>> {
-        self.trailer()?.get::<Dict<'_>>(ENCRYPT)
+        match self.encryption_kind() {
+            EncryptionKind::Encrypted { dict } => Some(dict),
+            EncryptionKind::Absent | EncryptionKind::Malformed => None,
+        }
     }
 
     /// Whether the document is encrypted.
     ///
-    /// Equivalent to `self.encryption_dict().is_some()`.
+    /// Equivalent to `self.encryption_dict().is_some()`. A present-but-
+    /// malformed `/Encrypt` is **not** reported as encrypted; use
+    /// [`XRef::encryption_kind`] to detect that case.
     pub fn is_encrypted(&self) -> bool {
         self.encryption_dict().is_some()
     }
@@ -1105,6 +1173,34 @@ impl XRef {
             }
         }
     }
+}
+
+/// The state of a document's `/Encrypt` trailer entry.
+///
+/// The `Option<Dict>` returned by [`XRef::encryption_dict`] collapses "no
+/// `/Encrypt`" and "`/Encrypt` present but unreadable" to the same `None`.
+/// This enum keeps them distinct — a distinction meaningful for conformance
+/// reporting, where a plaintext document and a document with a broken
+/// encryption entry are not the same thing. Mirrors
+/// [`LinearizationKind`](crate::linearization::LinearizationKind).
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum EncryptionKind<'a> {
+    /// No `/Encrypt` entry in the trailer, or a `null` one (ISO 32000-1
+    /// §7.3.7 treats a null value the same as an omitted entry): the
+    /// document is not encrypted (ISO 32000-1 §7.6.2 — absence of the entry
+    /// means the document shall be considered not encrypted).
+    Absent,
+    /// `/Encrypt` is present in the trailer but does not resolve to a
+    /// dictionary — e.g. a dangling indirect reference or a non-dictionary
+    /// value. The document could not be treated as encrypted.
+    Malformed,
+    /// `/Encrypt` resolved to an encryption dictionary (ISO 32000-1 §7.6,
+    /// "Table 20 — Entries common to all encryption dictionaries").
+    Encrypted {
+        /// The resolved encryption dictionary.
+        dict: Dict<'a>,
+    },
 }
 
 /// An input that is passed to the xref constructor so that we can fully resolve
@@ -2405,6 +2501,158 @@ mod tests {
         let enc = pdf.encryption_dict().expect("encryption dict");
         let filter = enc.get::<Name<'_>>(b"Filter").expect("Filter name");
         assert_eq!(filter.deref(), b"Standard");
+    }
+
+    #[test]
+    fn encryption_kind_absent_for_unencrypted_pdf() {
+        // A plaintext document has no /Encrypt: Absent, not Malformed.
+        let bytes = build_pdf(
+            &[
+                "<< /Type /Catalog /Pages 2 0 R >>",
+                "<< /Type /Pages /Kids [] /Count 0 >>",
+            ],
+            "/Root 1 0 R",
+        );
+        let pdf = Pdf::new(bytes).expect("pdf loads");
+        assert!(matches!(pdf.encryption_kind(), EncryptionKind::Absent));
+        assert!(!pdf.is_encrypted());
+        assert!(pdf.encryption_dict().is_none());
+    }
+
+    #[test]
+    fn encryption_kind_malformed_for_present_but_nondict_encrypt() {
+        // /Encrypt is present in the trailer but is a bare integer, not a
+        // dictionary (nor an indirect reference to one). `get_decryptor`
+        // treats an unresolvable /Encrypt as no encryption, so the document
+        // loads as plaintext — yet the trailer DOES carry the key. This is
+        // exactly the case an `Option<Dict>` cannot tell apart from a truly
+        // absent /Encrypt; `encryption_kind()` reports it as Malformed.
+        let bytes = build_pdf(
+            &[
+                "<< /Type /Catalog /Pages 2 0 R >>",
+                "<< /Type /Pages /Kids [] /Count 0 >>",
+            ],
+            "/Root 1 0 R /Encrypt 42",
+        );
+        let pdf = Pdf::new(bytes).expect("pdf loads with a malformed /Encrypt as plaintext");
+        // The key is present in the trailer ...
+        assert!(pdf.trailer().expect("trailer").contains_key(ENCRYPT));
+        // ... but it does not resolve to a dictionary: Malformed, not Absent.
+        assert!(matches!(pdf.encryption_kind(), EncryptionKind::Malformed));
+        // The convenience accessors collapse Malformed to "not encrypted".
+        assert!(!pdf.is_encrypted());
+        assert!(pdf.encryption_dict().is_none());
+    }
+
+    #[test]
+    fn encryption_kind_absent_for_null_encrypt() {
+        // `/Encrypt null` is spec-equivalent to an omitted entry (ISO 32000-1
+        // §7.3.7: a dictionary entry whose value is null shall be treated the
+        // same as if the entry does not exist). The dict parser deliberately
+        // keeps null-valued keys in its offsets map, so the trailer's
+        // `contains_key(ENCRYPT)` still reports the entry as present — the
+        // trap that made `encryption_kind()` mislabel this plaintext document
+        // as Malformed. It must report Absent.
+        let bytes = build_pdf(
+            &[
+                "<< /Type /Catalog /Pages 2 0 R >>",
+                "<< /Type /Pages /Kids [] /Count 0 >>",
+            ],
+            "/Root 1 0 R /Encrypt null",
+        );
+        let pdf = Pdf::new(bytes).expect("pdf loads with a null /Encrypt as plaintext");
+        // The parser retains the null-valued key ...
+        assert!(pdf.trailer().expect("trailer").contains_key(ENCRYPT));
+        // ... but a null value is an omitted entry: Absent, not Malformed.
+        assert!(matches!(pdf.encryption_kind(), EncryptionKind::Absent));
+        assert!(!pdf.is_encrypted());
+        assert!(pdf.encryption_dict().is_none());
+    }
+
+    #[test]
+    fn encryption_kind_encrypted_carries_same_dict_as_encryption_dict() {
+        let bytes: &[u8] = include_bytes!("../../beeld-tests/pdfs/custom/encrypted_aes_128.pdf");
+        let pdf = Pdf::new(bytes.to_vec()).expect("aes-128 fixture loads");
+        match pdf.encryption_kind() {
+            EncryptionKind::Encrypted { dict } => {
+                // The kind's dict is the same one the convenience accessor
+                // returns (same underlying bytes).
+                assert_eq!(dict.data(), pdf.encryption_dict().expect("dict").data());
+                let filter = dict.get::<Name<'_>>(b"Filter").expect("Filter");
+                assert_eq!(filter.deref(), b"Standard");
+            }
+            other => panic!("expected Encrypted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encryption_present_for_rc4_v1_fixture() {
+        // RC4, V1/R2 (40-bit) — alongside the AES fixtures. RC4 is a stream
+        // cipher (length-preserving), so a wrongly-decrypted /O or /U would
+        // still be 32 bytes; asserting the exact raw bytes is what pins that
+        // no cipher ran (ISO 32000-1 §7.6.2: strings in /Encrypt are not
+        // encrypted — the T2 guard, here for RC4).
+        let bytes: &[u8] = include_bytes!("../../beeld-tests/pdfs/custom/encrypted_rc4_rev2.pdf");
+        let pdf = Pdf::new(bytes.to_vec()).expect("rc4 rev2 fixture loads");
+        assert!(pdf.is_encrypted());
+        assert!(matches!(
+            pdf.encryption_kind(),
+            EncryptionKind::Encrypted { .. }
+        ));
+
+        let enc = pdf.encryption_dict().expect("encryption dict");
+        assert_eq!(
+            enc.get::<Name<'_>>(b"Filter").expect("Filter").deref(),
+            b"Standard"
+        );
+        assert_eq!(enc.get::<i32>(b"V").expect("V"), 1, "rev2 fixture is V1");
+        assert_eq!(enc.get::<i32>(b"R").expect("R"), 2, "rev2 fixture is R2");
+
+        let o = enc.get::<object::String<'_>>(b"O").expect("/O");
+        assert_eq!(
+            o.as_bytes(),
+            &[
+                0x20, 0x55, 0xc7, 0x56, 0xc7, 0x2e, 0x1a, 0xd7, 0x02, 0x60, 0x8e, 0x81, 0x96, 0xac,
+                0xad, 0x44, 0x7a, 0xd3, 0x2d, 0x17, 0xcf, 0xf5, 0x83, 0x23, 0x5f, 0x6d, 0xd1, 0x5f,
+                0xed, 0x7d, 0xab, 0x67,
+            ],
+            "RC4 /O must be read raw (undecrypted)"
+        );
+        let u = enc.get::<object::String<'_>>(b"U").expect("/U");
+        assert_eq!(
+            u.as_bytes(),
+            &[
+                0x01, 0x54, 0x23, 0x89, 0xb2, 0xe5, 0x31, 0x6f, 0x5d, 0x4e, 0x01, 0x53, 0x50, 0xc7,
+                0x8d, 0x2b, 0x6e, 0x35, 0x96, 0x36, 0x4e, 0x92, 0xfa, 0x6d, 0x53, 0xb2, 0x13, 0x7e,
+                0x8d, 0x81, 0x0d, 0xd2,
+            ],
+            "RC4 /U must be read raw (undecrypted)"
+        );
+    }
+
+    #[test]
+    fn encryption_present_for_rc4_v2_fixture() {
+        // RC4, V2/R3 — the other RC4 variant (permitting key lengths > 40).
+        let bytes: &[u8] = include_bytes!("../../beeld-tests/pdfs/custom/encrypted_rc4_rev3.pdf");
+        let pdf = Pdf::new(bytes.to_vec()).expect("rc4 rev3 fixture loads");
+        assert!(pdf.is_encrypted());
+        assert!(matches!(
+            pdf.encryption_kind(),
+            EncryptionKind::Encrypted { .. }
+        ));
+
+        let enc = pdf.encryption_dict().expect("encryption dict");
+        assert_eq!(enc.get::<i32>(b"V").expect("V"), 2, "rev3 fixture is V2");
+        assert_eq!(enc.get::<i32>(b"R").expect("R"), 3, "rev3 fixture is R3");
+
+        // Raw (undecrypted) /O: 32 bytes with the fixture's known prefix.
+        let o = enc.get::<object::String<'_>>(b"O").expect("/O");
+        assert_eq!(o.as_bytes().len(), 32, "RC4 /O must be 32 raw bytes");
+        assert_eq!(
+            &o.as_bytes()[..4],
+            &[0xfe, 0xe2, 0xc6, 0x7f],
+            "RC4 /O must be read raw (undecrypted)"
+        );
     }
 
     #[test]

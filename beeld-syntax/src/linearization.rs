@@ -453,25 +453,30 @@ mod tests {
 
         // base_trailer() walks /Prev to the terminus (the base
         // section, with /ID = [<AAAA> <BBBB>]).
-        let latest = pdf.base_trailer().expect("latest trailer");
-        let latest_id_first = latest
+        let base = pdf.base_trailer().expect("base trailer");
+        let base_id_first = base
             .get::<Array<'_>>(b"ID")
             .and_then(|a| a.flex_iter().next::<PdfString<'_>>())
             .expect("base /ID[0]");
-        assert_eq!(latest_id_first.as_ref(), &[0xAA, 0xAA]);
+        assert_eq!(base_id_first.as_ref(), &[0xAA, 0xAA]);
     }
 
     #[cfg(feature = "inspect")]
     #[test]
     fn base_trailer_equals_trailer_for_single_section() {
         let pdf = Pdf::new(build_non_linearized()).expect("pdf loads");
-        let a: i32 = pdf.trailer().expect("trailer").get(b"Size").expect("Size");
-        let b: i32 = pdf
-            .base_trailer()
-            .expect("latest trailer")
-            .get(b"Size")
-            .expect("Size");
-        assert_eq!(a, b);
+        let trailer = pdf.trailer().expect("trailer");
+        let base = pdf.base_trailer().expect("base trailer");
+        // A single-section document has one trailer, so base_trailer() must
+        // agree with trailer() on identity and contents — not merely be Some.
+        let trailer_size: i32 = trailer.get(b"Size").expect("Size");
+        let base_size: i32 = base.get(b"Size").expect("Size");
+        assert_eq!(trailer_size, base_size);
+        assert_eq!(base_size, 3);
+        assert_eq!(
+            base.get_ref(b"Root").expect("base /Root ref"),
+            trailer.get_ref(b"Root").expect("trailer /Root ref"),
+        );
     }
 
     #[cfg(feature = "inspect")]
@@ -482,16 +487,17 @@ mod tests {
         let pdf = Pdf::new(bytes.to_vec()).expect("linearized fixture loads");
         assert!(pdf.is_linearized());
 
-        // startxref-pinned trailer == first-page trailer for a
-        // linearised PDF per Annex F.2.
+        // startxref-pinned trailer == first-page trailer for a linearised
+        // PDF: startxref gives the offset of the first-page cross-reference
+        // table (ISO 32000-2 Annex F.3.11, "Main cross-reference and trailer").
         let startxref_trailer = pdf.trailer().expect("startxref trailer");
-        let latest = pdf.base_trailer().expect("latest trailer");
+        let base = pdf.base_trailer().expect("base trailer");
 
         // The first-page trailer and the main trailer cover different
         // byte spans, so their raw dict slices must differ.
         assert_ne!(
             startxref_trailer.data().as_ptr(),
-            latest.data().as_ptr(),
+            base.data().as_ptr(),
             "linearised file must expose distinct first-page and main trailers"
         );
     }
@@ -502,5 +508,49 @@ mod tests {
         use crate::xref::XRef;
         let dummy = XRef::dummy();
         assert!(dummy.base_trailer().is_none());
+    }
+
+    /// The `catalog-in-objstm-aes` fixture is AES-256 encrypted and has a
+    /// single cross-reference *stream* section whose dict carries a direct
+    /// `/ID`. Per ISO 32000-1 §7.5.8.2 the cross-reference stream
+    /// dictionary's strings shall not be encrypted, so `base_trailer()`
+    /// (which walks to the terminal Stream section) must return the same raw
+    /// `/ID` as `trailer()` — never a value run through the cipher. Before
+    /// the fix, the Stream path read the dict as an indirect object, which
+    /// set the object number and decrypted its strings.
+    #[cfg(feature = "inspect")]
+    #[test]
+    fn base_trailer_does_not_decrypt_xref_stream_dict_strings() {
+        use crate::object::Array;
+        use crate::object::String as PdfString;
+
+        let bytes: &[u8] =
+            include_bytes!("../../beeld-tests/pdfs/custom/catalog-in-objstm-aes.pdf");
+        let pdf = Pdf::new(bytes.to_vec()).expect("xref-stream aes fixture loads");
+        assert!(pdf.is_encrypted());
+
+        let id_first = |d: &Dict<'_>| -> Vec<u8> {
+            d.get::<Array<'_>>(b"ID")
+                .and_then(|a| a.flex_iter().next::<PdfString<'_>>())
+                .expect("/ID[0]")
+                .to_vec()
+        };
+
+        let base = pdf.base_trailer().expect("base trailer");
+        let trailer = pdf.trailer().expect("trailer");
+        let base_id = id_first(&base);
+        let trailer_id = id_first(&trailer);
+
+        // trailer() is known not to decrypt the trailer dict; base_trailer()
+        // must agree, and the raw /ID here is exactly 16 bytes.
+        assert_eq!(
+            base_id.len(),
+            16,
+            "xref-stream dict /ID must be raw 16 bytes"
+        );
+        assert_eq!(
+            base_id, trailer_id,
+            "base_trailer() must not decrypt the cross-reference stream dict"
+        );
     }
 }

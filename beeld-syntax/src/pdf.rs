@@ -224,7 +224,8 @@ impl Pdf {
         self.xref.trailer()
     }
 
-    /// Return the trailer dictionary pinned by `startxref`.
+    /// Return the trailer of the base (oldest) cross-reference section —
+    /// the `/Prev`-chain terminus.
     ///
     /// Convenience accessor for [`XRef::base_trailer`]. See that
     /// method for semantics — in particular, for a linearised document
@@ -238,10 +239,22 @@ impl Pdf {
         self.xref.base_trailer()
     }
 
+    /// Return the state of the document's `/Encrypt` trailer entry.
+    ///
+    /// Convenience accessor for [`XRef::encryption_kind`]. Use this to tell
+    /// a plaintext document (no `/Encrypt`) from one whose `/Encrypt` entry
+    /// is present but malformed; most callers can use the convenience
+    /// [`Self::encryption_dict`] / [`Self::is_encrypted`].
+    pub fn encryption_kind(&self) -> crate::xref::EncryptionKind<'_> {
+        self.xref.encryption_kind()
+    }
+
     /// Return the document's encryption dictionary, if any.
     ///
     /// Convenience accessor for [`XRef::encryption_dict`]. See that method
-    /// for behaviour and the re-parse performance note.
+    /// for behaviour and the re-parse performance note. To distinguish an
+    /// absent `/Encrypt` from a present-but-malformed one, use
+    /// [`Self::encryption_kind`].
     pub fn encryption_dict(&self) -> Option<Dict<'_>> {
         self.xref.encryption_dict()
     }
