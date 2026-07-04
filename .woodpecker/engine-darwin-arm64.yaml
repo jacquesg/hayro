@@ -59,10 +59,17 @@ steps:
       # then run the tests (fmt/clippy/doc/deny run once on Linux).
       - |
         set -e
-        cd "$$(eval echo ~"$$(id -un)")/woodpecker-cache/src/$${CI_REPO_NAME:-beeld}"
-        # Fetch the private svgraster git dep over token-HTTPS rather than ssh:// (no
-        # SSH key on the runner). The local backend shares $HOME across workflows, so
-        # clear any stale lock a killed run left before writing --global.
+        # The local backend points HOME at a per-pipeline temp dir, but the
+        # `git config --global` below must land in the SAME home cargo's git subprocess
+        # reads, or the ssh->https rewrite is invisible and the private-dep fetch hangs on
+        # ssh. Restore HOME from the passwd db first (as sdk/scripts/ci-cache-env.sh does;
+        # rustup needs it too). CARGO_HOME then defaults under it, so the git-dep clone
+        # cache also persists.
+        export HOME="$$(eval echo ~"$$(id -un)")"
+        cd "$${HOME}/woodpecker-cache/src/$${CI_REPO_NAME:-beeld}"
+        # Fetch the private git.bloudraad.io deps (svgraster, henog) over token-HTTPS
+        # rather than ssh:// — no SSH key on the runner. Clear any stale global-config
+        # lock a killed run left before writing --global.
         rm -f "$${HOME}/.gitconfig.lock" 2>/dev/null || true
         git config --global url."https://oauth2:$${FORGE_CLONE_TOKEN}@git.bloudraad.io/".insteadOf "ssh://git@git.bloudraad.io/"
         mise trust --all
