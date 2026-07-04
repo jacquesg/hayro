@@ -24,21 +24,33 @@ use alloc::vec::Vec;
 
 /// An error raised by a [`ReadAt`] source.
 ///
-/// Deliberately coarse: the parser only needs to distinguish "the source
-/// failed" from a clean end-of-input (which is signalled by a short read,
-/// not an error). The enum is `#[non_exhaustive]` so future variants do
-/// not break callers.
+/// Deliberately coarse: the parser distinguishes a hard source failure
+/// ([`Io`](ReadAtError::Io)) and a "not yet, retry later" signal for a
+/// partial download ([`Pending`](ReadAtError::Pending)) from a clean
+/// end-of-input, which is signalled by a short read rather than an error.
+/// The enum is `#[non_exhaustive]` so future variants do not break callers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ReadAtError {
     /// The underlying source reported an I/O failure.
     Io,
+    /// The requested bytes lie within the source's reported length but are
+    /// not yet available — a partially-downloaded Fast Web View prefix
+    /// (ISO 32000-2 Annex F, §G.2) that has not reached this range. Unlike
+    /// [`Io`](ReadAtError::Io) this is transient: a streaming consumer
+    /// should fetch more of the source and retry the same read rather than
+    /// treat the document as broken. A short read still means a clean
+    /// end-of-source; `Pending` is reserved for bytes genuinely
+    /// absent-for-now, so nothing derived from it is cached and a later
+    /// read re-issues.
+    Pending,
 }
 
 impl core::fmt::Display for ReadAtError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Io => f.write_str("positioned-read source I/O error"),
+            Self::Pending => f.write_str("positioned-read source bytes not yet available"),
         }
     }
 }
@@ -84,7 +96,10 @@ pub trait ReadAt {
     ///
     /// May read fewer bytes than `buf.len()` only when the end of the
     /// source is reached; returns `0` when `offset >= len()`. Returns
-    /// [`ReadAtError`] only on a genuine source failure.
+    /// [`ReadAtError::Io`] on a genuine source failure, or
+    /// [`ReadAtError::Pending`] when the requested bytes lie within
+    /// [`len`](ReadAt::len) but are not yet available in a partial
+    /// download (the caller retries after more of the source lands).
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, ReadAtError>;
 
     /// Read repeatedly from `offset` until `buf` is full or the end of the

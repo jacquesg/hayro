@@ -6,12 +6,19 @@
 //! head that lets a network reader render page 1 before downloading
 //! the remainder.
 //!
-//! This module exposes the parameter dict without decoding the hint
-//! streams.
+//! This module exposes the parameter dict; the [`hint`] submodule decodes
+//! the hint tables it points to (ISO 32000-2 Annex F.4).
 
 use crate::object::{Dict, ObjectIdentifier};
 use crate::xref::{EntryType, XRef};
 use alloc::vec::Vec;
+
+pub mod hint;
+
+pub use hint::{
+    HintTables, PageEntry, PageOffsetHeader, PageOffsetTable, SharedGroup, SharedObjectHeader,
+    SharedObjectTable, SharedRef,
+};
 
 /// Linearization parameter data (ISO 32000-1 Annex F).
 ///
@@ -30,14 +37,24 @@ pub struct Linearization {
     pub length: usize,
     /// Value of `/O` — the first page's object number.
     pub first_page_object: i32,
-    /// Value of `/E` — offset of the end of the first page.
+    /// Value of `/E` — the offset of the end of the first page, relative
+    /// to the beginning of the PDF file (Table F.1).
     pub first_page_end_offset: usize,
-    /// Value of `/T` — offset of the main xref table.
+    /// Value of `/T` — the offset of the white-space character preceding
+    /// object 0 of the main cross-reference table (standard and hybrid
+    /// files), or the offset of the main cross-reference *stream object*
+    /// for files that use cross-reference streams exclusively. Distinct
+    /// from the first-page trailer's `/Prev`, which locates the `xref`
+    /// line preceding that table (Table F.1).
     pub main_xref_offset: usize,
     /// Value of `/N` — number of pages.
     pub page_count: i32,
-    /// Value of `/H` — hint stream offsets. An array of 2 or 4 integers
-    /// per §F.2.4. `None` when absent.
+    /// Value of `/H` — the primary hint stream's offset and length, and
+    /// optionally an overflow hint stream's: an array of 2 or 4 integers
+    /// `[offset1 length1]` or `[offset1 length1 offset2 length2]`
+    /// (Table F.1, §F.3.3). `/H` is *required*, so a genuine parse always
+    /// yields `Some`; an absent, wrong-arity, or non-integer `/H` is
+    /// reported as [`LinearizationKind::Malformed`].
     pub hint_offsets: Option<Vec<usize>>,
     /// Value of `/P` — first page number. `None` when absent (treat as 0).
     pub first_page_number: Option<i32>,
@@ -57,6 +74,10 @@ pub enum LinearizationError {
     /// A required key was present but of the wrong type (e.g. `/L` was
     /// a name rather than a number).
     InvalidType(&'static [u8]),
+    /// A required array-valued key had the wrong number of elements
+    /// (e.g. `/H` was neither 2 nor 4 integers, per Table F.1). The byte
+    /// slice is the key name.
+    InvalidArity(&'static [u8]),
 }
 
 /// State of the linearization parameter dict in a document.
@@ -65,6 +86,32 @@ pub enum LinearizationError {
 /// that *claims* linearization but whose parameter dict is broken — a
 /// distinction meaningful for conformance reporting but collapsed by
 /// an `Option<Linearization>` API.
+///
+/// # Three layers of linearization
+///
+/// Linearization has three progressively stronger properties, each the
+/// subset of the one before it:
+///
+/// 1. **Claimed** — [`Pdf::is_linearized`] is `true`: the first indirect
+///    object carries a `/Linearized` key. Holds for both [`Malformed`]
+///    and [`Present`]; only [`Absent`] fails it.
+/// 2. **Parsed** — [`Pdf::linearization`] is `Some`, i.e. this enum is
+///    [`Present`]: every required Table F.1 entry parsed successfully.
+/// 3. **Genuine** — [`Pdf::is_genuinely_linearized`] is `true`: the
+///    parsed `/L` equals the actual file length (Table F.1, §G.2), so
+///    the file may be opened at its first page. See [`Genuineness`].
+///
+/// This enum is the *parsing* axis (layers 1–2). Genuineness is a
+/// separate *runtime* axis (layer 3) and does not affect the variants
+/// here: a [`Present`] dict whose `/L` mismatches the file length stays
+/// [`Present`].
+///
+/// [`Pdf::is_linearized`]: crate::Pdf::is_linearized
+/// [`Pdf::linearization`]: crate::Pdf::linearization
+/// [`Pdf::is_genuinely_linearized`]: crate::Pdf::is_genuinely_linearized
+/// [`Absent`]: LinearizationKind::Absent
+/// [`Malformed`]: LinearizationKind::Malformed
+/// [`Present`]: LinearizationKind::Present
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum LinearizationKind<'a> {
@@ -81,6 +128,41 @@ pub enum LinearizationKind<'a> {
     },
     /// Valid linearization parameter dict.
     Present(Linearization),
+}
+
+/// Whether a document's linearization is *genuine* — the runtime
+/// validity layer, distinct from the parse-time [`LinearizationKind`].
+///
+/// ISO 32000-2 Table F.1 makes `/L` decisive: the declared length "shall
+/// be exactly equal to the actual length of the PDF file. A mismatch
+/// indicates that the file is not linearized and shall be treated as
+/// ordinary PDF file, ignoring linearization information." §G.2 uses this
+/// same check as the open-time gate, in lieu of seeking to `startxref`.
+///
+/// This is layer 3 of the model documented on [`LinearizationKind`]: a
+/// [`Present`] parameter dict may still be non-genuine — an update was
+/// appended after linearization, or the dict is forged — in which case
+/// the file must be treated as an ordinary PDF.
+///
+/// [`Present`]: LinearizationKind::Present
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Genuineness {
+    /// No `/Linearized` dict, or it failed to parse
+    /// ([`LinearizationKind::Absent`] or [`LinearizationKind::Malformed`]).
+    NotLinearized,
+    /// The parameter dict parsed, but `/L` does not equal the actual file
+    /// length (Table F.1): an update was appended after linearization, or
+    /// the dict is not genuine. Treat as an ordinary PDF file.
+    LengthMismatch {
+        /// The `/L` value declared in the parameter dict.
+        declared: u64,
+        /// The actual byte length of the PDF source.
+        actual: u64,
+    },
+    /// The parameter dict parsed and its `/L` equals the actual file
+    /// length: the file is genuinely linearized.
+    Genuine,
 }
 
 /// Internal cached form: no lifetime so it can live in `OnceLock`.
@@ -154,18 +236,37 @@ fn get_required_i32(dict: &Dict<'_>, key: &'static [u8]) -> Result<i32, Lineariz
     i32::try_from(value).map_err(|_| LinearizationError::OffsetTooLarge(key))
 }
 
-fn parse_hint_offsets(dict: &Dict<'_>) -> Result<Option<Vec<usize>>, LinearizationError> {
+fn parse_hint_offsets(dict: &Dict<'_>) -> Result<Vec<usize>, LinearizationError> {
     use crate::object::Array;
-    let array = match dict.get::<Array<'_>>(b"H") {
-        Some(a) => a,
-        None if !dict.contains_key(b"H") => return Ok(None),
-        None => return Err(LinearizationError::InvalidType(b"H")),
-    };
+    // `/H` is Required (Table F.1): an absent key is a malformed dict, not
+    // a legitimately hint-free file.
+    if !dict.contains_key(b"H") {
+        return Err(LinearizationError::MissingRequired(b"H"));
+    }
+    let array = dict
+        .get::<Array<'_>>(b"H")
+        .ok_or(LinearizationError::InvalidType(b"H"))?;
+
+    // `raw_iter` yields one token per array slot regardless of element
+    // type, so its count is the true arity — unlike `iter::<i64>()`, which
+    // stops at the first non-integer and would silently truncate e.g.
+    // `[1234 /Foo 56]` to a single element.
+    let arity = array.raw_iter().count();
+    if arity != 2 && arity != 4 {
+        return Err(LinearizationError::InvalidArity(b"H"));
+    }
+
+    // Every slot must be an integer. Reading exactly `arity` elements as
+    // i64 means a `None` here is a non-integer element, not exhaustion.
+    let mut iter = array.flex_iter();
     let mut out: Vec<usize> = Vec::new();
-    for value in array.iter::<i64>() {
+    for _ in 0..arity {
+        let value = iter
+            .next::<i64>()
+            .ok_or(LinearizationError::InvalidType(b"H"))?;
         out.push(usize::try_from(value).map_err(|_| LinearizationError::OffsetTooLarge(b"H"))?);
     }
-    Ok(Some(out))
+    Ok(out)
 }
 
 fn parse_linearization(dict: &Dict<'_>) -> Result<Linearization, LinearizationError> {
@@ -175,7 +276,9 @@ fn parse_linearization(dict: &Dict<'_>) -> Result<Linearization, LinearizationEr
     let first_page_end_offset = get_required_usize(dict, b"E")?;
     let main_xref_offset = get_required_usize(dict, b"T")?;
     let page_count = get_required_i32(dict, b"N")?;
-    let hint_offsets = parse_hint_offsets(dict)?;
+    // `/H` is required, so a successful parse always carries offsets; the
+    // field stays `Option` to keep the public shape stable.
+    let hint_offsets = Some(parse_hint_offsets(dict)?);
     let first_page_number = dict.get::<i32>(b"P");
 
     Ok(Linearization {
@@ -358,8 +461,9 @@ mod tests {
 
     #[test]
     fn tier_b_real_linearized_fixture() {
-        let bytes: &[u8] =
-            include_bytes!("../../beeld-tests/pdfs/custom/andler-optimal-lot-size_linearized.pdf");
+        let bytes: &[u8] = include_bytes!(
+            "../../../beeld-tests/pdfs/custom/andler-optimal-lot-size_linearized.pdf"
+        );
         let pdf = Pdf::new(bytes.to_vec()).expect("linearized fixture loads");
         assert!(pdf.is_linearized());
         let lin = pdf.linearization().expect("parsed linearization");
@@ -368,11 +472,344 @@ mod tests {
         assert!(lin.length > 0);
     }
 
+    /// Parse `build_linearized_with_dict(body)` and return the parse
+    /// failure reason, panicking if the dict is not `Malformed`.
+    fn malformed_reason(body: &str) -> LinearizationError {
+        let pdf = Pdf::new(build_linearized_with_dict(body)).expect("pdf loads");
+        match pdf.linearization_kind() {
+            LinearizationKind::Malformed { reason, .. } => reason,
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    // ----- /H hardening (Ln5): required, arity {2,4}, integers only -----
+
+    #[test]
+    fn h_absent_is_missing_required() {
+        // /H is Required (Table F.1): an absent key is a malformed dict.
+        let dict = "<< /Linearized 1.0 /L 1024 /O 4 /E 999 /N 1 /T 512 >>";
+        assert_eq!(
+            malformed_reason(dict),
+            LinearizationError::MissingRequired(b"H")
+        );
+    }
+
+    #[test]
+    fn h_wrong_arity_is_invalid_arity() {
+        for body in [
+            "<< /Linearized 1.0 /L 1024 /O 4 /E 999 /N 1 /T 512 /H [1] >>",
+            "<< /Linearized 1.0 /L 1024 /O 4 /E 999 /N 1 /T 512 /H [1 2 3] >>",
+            "<< /Linearized 1.0 /L 1024 /O 4 /E 999 /N 1 /T 512 /H [1 2 3 4 5] >>",
+            // Arity 3 (raw_iter counts the /Foo slot), so this is rejected as
+            // wrong-arity rather than silently truncated to a single [1234].
+            "<< /Linearized 1.0 /L 1024 /O 4 /E 999 /N 1 /T 512 /H [1234 /Foo 56] >>",
+        ] {
+            assert_eq!(
+                malformed_reason(body),
+                LinearizationError::InvalidArity(b"H"),
+                "body: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn h_non_integer_element_is_invalid_type() {
+        // Valid arity (2) but a non-integer element: an error, not a
+        // truncated [1234].
+        let dict = "<< /Linearized 1.0 /L 1024 /O 4 /E 999 /N 1 /T 512 /H [1234 /Foo] >>";
+        assert_eq!(
+            malformed_reason(dict),
+            LinearizationError::InvalidType(b"H")
+        );
+    }
+
+    #[test]
+    fn h_negative_is_offset_too_large() {
+        let dict = "<< /Linearized 1.0 /L 1024 /O 4 /E 999 /N 1 /T 512 /H [-1 2] >>";
+        assert_eq!(
+            malformed_reason(dict),
+            LinearizationError::OffsetTooLarge(b"H")
+        );
+    }
+
+    #[test]
+    fn h_non_array_is_invalid_type() {
+        let dict = "<< /Linearized 1.0 /L 1024 /O 4 /E 999 /N 1 /T 512 /H 5 >>";
+        assert_eq!(
+            malformed_reason(dict),
+            LinearizationError::InvalidType(b"H")
+        );
+    }
+
+    #[test]
+    fn h_four_arity_parses() {
+        let dict = "<< /Linearized 1.0 /L 1024 /O 4 /E 999 /N 1 /T 512 /H [100 200 300 400] >>";
+        let pdf = Pdf::new(build_linearized_with_dict(dict)).expect("pdf loads");
+        let lin = pdf.linearization().expect("parsed linearization");
+        assert_eq!(
+            lin.hint_offsets,
+            Some(alloc::vec![100_usize, 200, 300, 400])
+        );
+    }
+
+    // ----- OffsetTooLarge on other required integers, and /P wrong-type -----
+
+    #[test]
+    fn l_negative_is_offset_too_large() {
+        let dict = "<< /Linearized 1.0 /L -1 /O 4 /E 999 /N 1 /T 512 /H [1 2] >>";
+        assert_eq!(
+            malformed_reason(dict),
+            LinearizationError::OffsetTooLarge(b"L")
+        );
+    }
+
+    #[test]
+    fn o_overflowing_i32_is_offset_too_large() {
+        // 3_000_000_000 > i32::MAX but fits i64, so /O overflows the i32 narrow.
+        let dict = "<< /Linearized 1.0 /L 1024 /O 3000000000 /E 999 /N 1 /T 512 /H [1 2] >>";
+        assert_eq!(
+            malformed_reason(dict),
+            LinearizationError::OffsetTooLarge(b"O")
+        );
+    }
+
+    #[test]
+    fn n_overflowing_i32_is_offset_too_large() {
+        let dict = "<< /Linearized 1.0 /L 1024 /O 4 /E 999 /N 3000000000 /T 512 /H [1 2] >>";
+        assert_eq!(
+            malformed_reason(dict),
+            LinearizationError::OffsetTooLarge(b"N")
+        );
+    }
+
+    #[test]
+    fn p_wrong_type_yields_none_page_number() {
+        // /P is Optional (Table F.1, default 0); a wrong-typed value is not a
+        // parse failure — the dict is Present with first_page_number == None.
+        let dict = "<< /Linearized 1.0 /L 1024 /O 4 /E 999 /N 1 /T 512 /H [1 2] /P /Foo >>";
+        let pdf = Pdf::new(build_linearized_with_dict(dict)).expect("pdf loads");
+        let lin = pdf.linearization().expect("parsed despite bad /P");
+        assert!(lin.first_page_number.is_none());
+    }
+
+    // ----- Genuineness (Ln1): /L == file length is the only demoting check ---
+
+    #[test]
+    fn genuine_fixture_is_genuine() {
+        let bytes: &[u8] = include_bytes!(
+            "../../../beeld-tests/pdfs/custom/andler-optimal-lot-size_linearized.pdf"
+        );
+        let pdf = Pdf::new(bytes.to_vec()).expect("linearized fixture loads");
+        assert!(pdf.is_genuinely_linearized());
+        assert_eq!(pdf.linearization_genuineness(), Genuineness::Genuine);
+        let lin = pdf.linearization().expect("parsed linearization");
+        // /L equals the actual file length (Table F.1, §G.2).
+        assert_eq!(lin.length, 99762);
+        assert_eq!(lin.length as u64, pdf.data().len());
+    }
+
+    #[test]
+    fn appended_update_is_length_mismatch() {
+        let bytes: &[u8] = include_bytes!(
+            "../../../beeld-tests/pdfs/custom/andler-optimal-lot-size_linearized.pdf"
+        );
+        let mut b = bytes.to_vec();
+        b.push(b'\n'); // simulate an appended update: 99762 -> 99763 bytes.
+        let pdf = Pdf::new(b).expect("appended fixture still loads");
+        // The claim and the parse are unchanged; only genuineness demotes.
+        assert!(pdf.is_linearized());
+        assert!(!pdf.is_genuinely_linearized());
+        assert_eq!(
+            pdf.linearization_genuineness(),
+            Genuineness::LengthMismatch {
+                declared: 99762,
+                actual: 99763,
+            }
+        );
+        // A non-genuine file demotes the fast-path accessors (design §6): both
+        // gate on genuine linearization, so both yield None even though the
+        // dict still parses.
+        assert!(pdf.first_page_byte_range().is_none());
+        assert!(pdf.hint_tables().is_none());
+    }
+
+    #[test]
+    fn forged_dict_not_genuine() {
+        // A synthetic file of a few hundred bytes whose /L claims 1024.
+        let dict = "<< /Linearized 1.0 /L 1024 /O 4 /E 999 /N 1 /T 512 /H [1234 56] >>";
+        let pdf = Pdf::new(build_linearized_with_dict(dict)).expect("pdf loads");
+        // Parse axis is untouched: the dict is still Present (orthogonality).
+        assert!(matches!(
+            pdf.linearization_kind(),
+            LinearizationKind::Present(_)
+        ));
+        // Runtime axis rejects it: /L (1024) != actual file length.
+        let actual = pdf.data().len();
+        assert_ne!(actual, 1024);
+        assert_eq!(
+            pdf.linearization_genuineness(),
+            Genuineness::LengthMismatch {
+                declared: 1024,
+                actual,
+            }
+        );
+        assert!(!pdf.is_genuinely_linearized());
+    }
+
+    // ----- Hint-table decode against the real fixture (empirical pin) -------
+
+    fn andler() -> Pdf {
+        let bytes: &[u8] = include_bytes!(
+            "../../../beeld-tests/pdfs/custom/andler-optimal-lot-size_linearized.pdf"
+        );
+        Pdf::new(bytes.to_vec()).expect("linearized fixture loads")
+    }
+
+    #[test]
+    fn hint_tables_decode_andler() {
+        let pdf = andler();
+        let tables = pdf.hint_tables().expect("hint tables decode");
+        let lin = pdf.linearization().expect("parsed linearization");
+        // One page-offset entry per page (/N == 3).
+        assert_eq!(
+            tables.page_offset.pages.len(),
+            usize::try_from(lin.page_count).unwrap(),
+        );
+        // The first page references no shared objects (F.4.4 / Table F.4 item 3).
+        assert!(tables.page_offset.pages[0].shared_refs.is_empty());
+        // The shared object table enters every first-page object (F.4.3): the
+        // fixture's first page has 26 objects, all in the first-page sequence
+        // (total_entry_count == first_page_entry_count), each a 1-object group.
+        assert_eq!(tables.shared.header.first_page_entry_count, 26);
+        assert_eq!(tables.shared.header.total_entry_count, 26);
+        assert_eq!(tables.shared.groups.len(), 26);
+    }
+
+    #[test]
+    fn hint_page0_matches_lin() {
+        let pdf = andler();
+        let tables = pdf.hint_tables().expect("hint tables decode");
+        let lin = pdf.linearization().expect("parsed linearization");
+
+        // page 0's object number is /O (Table F.4 item 1).
+        assert_eq!(
+            tables.page_object_number(0, lin),
+            Some(lin.first_page_object),
+        );
+        assert_eq!(lin.first_page_object, 180);
+
+        // page 0's byte range starts at /O's cross-reference offset and ends at
+        // /E — cross-checking the F.4.1 adjustment and the page-0 length.
+        let range = tables.page_byte_range(0, lin).expect("page 0 range");
+        assert_eq!(range.start, 83298); // offset(/O)
+        assert_eq!(range.end, lin.first_page_end_offset as u64); // /E
+        assert_eq!(range.end, 88106);
+    }
+
+    #[test]
+    fn hint_offsets_resolve() {
+        let pdf = andler();
+        let tables = pdf.hint_tables().expect("hint tables decode");
+        let lin = pdf.linearization().expect("parsed linearization");
+
+        // Every derived page object number resolves to a Normal cross-reference
+        // entry whose byte offset lies within the derived page byte range.
+        for page in 0..usize::try_from(lin.page_count).unwrap() {
+            let number = tables
+                .page_object_number(page, lin)
+                .unwrap_or_else(|| panic!("page {page} object number"));
+            let range = tables
+                .page_byte_range(page, lin)
+                .unwrap_or_else(|| panic!("page {page} byte range"));
+            match pdf.xref().entry(ObjectIdentifier::new(number, 0)) {
+                Some(EntryType::Normal { offset }) => {
+                    let offset = offset as u64;
+                    assert!(
+                        range.contains(&offset),
+                        "page {page}: object {number} at {offset} not in {range:?}",
+                    );
+                }
+                other => panic!("page {page}: object {number} not Normal: {other:?}"),
+            }
+        }
+    }
+
+    /// The `andler` fixture's shared object table has an *empty* shared-objects
+    /// section (`first_page_entry_count == total_entry_count == 26`), so its
+    /// groups decode identically whether the table is read as one column-major
+    /// block or two. This fixture has a *non-empty* section
+    /// (`first_page_entry_count == 20`, `total_entry_count == 26`): F.4.3's
+    /// group entries are a single column-major block over all 26 groups, and
+    /// reading them as two independent blocks overruns the table's byte span
+    /// and aborts the whole decode to `None`. Pins the one-block transposition
+    /// (design §7.7) against a genuine linearizer with a non-empty section.
+    #[test]
+    fn hint_tables_decode_non_empty_shared_section() {
+        let bytes: &[u8] = include_bytes!(
+            "../../../beeld-tests/pdfs/custom/font_truetype_slow_post_lookup.pdf"
+        );
+        let pdf = Pdf::new(bytes.to_vec()).expect("linearized fixture loads");
+        assert!(pdf.is_genuinely_linearized()); // /L == file length == 69778
+        let tables = pdf.hint_tables().expect("hint tables decode");
+        let lin = pdf.linearization().expect("parsed linearization");
+
+        // One page-offset entry per page (/N == 7); page 0 shares nothing.
+        assert_eq!(lin.page_count, 7);
+        assert_eq!(tables.page_offset.pages.len(), 7);
+        panic!(
+            "DEBUG hdr={:?} S={:?} pages={:?}",
+            tables.page_offset.header,
+            pdf.hint_tables().map(|t| &t.shared.header),
+            tables
+                .page_offset
+                .pages
+                .iter()
+                .map(|p| (p.object_count, p.page_length, p.shared_refs.len()))
+                .collect::<Vec<_>>(),
+        );
+
+        // The shared section is genuinely non-empty: 20 first-page groups and 6
+        // shared-section groups, all 26 decoded as one column-major block.
+        assert_eq!(tables.shared.header.first_page_entry_count, 20);
+        assert_eq!(tables.shared.header.total_entry_count, 26);
+        assert_eq!(tables.shared.groups.len(), 26);
+
+        // page 0's first object is /O (251); its byte range ends at /E (13923),
+        // cross-checking the F.4.1 adjustment and the page-0 length.
+        assert_eq!(tables.page_object_number(0, lin), Some(lin.first_page_object));
+        assert_eq!(lin.first_page_object, 251);
+        let range0 = tables.page_byte_range(0, lin).expect("page 0 range");
+        assert_eq!(range0.end, lin.first_page_end_offset as u64);
+        assert_eq!(range0.end, 13923);
+
+        // Every derived page object number resolves to a Normal cross-reference
+        // entry whose byte offset lies within the derived page byte range.
+        for page in 0..usize::try_from(lin.page_count).unwrap() {
+            let number = tables
+                .page_object_number(page, lin)
+                .unwrap_or_else(|| panic!("page {page} object number"));
+            let range = tables
+                .page_byte_range(page, lin)
+                .unwrap_or_else(|| panic!("page {page} byte range"));
+            match pdf.xref().entry(ObjectIdentifier::new(number, 0)) {
+                Some(EntryType::Normal { offset }) => {
+                    let offset = offset as u64;
+                    assert!(
+                        range.contains(&offset),
+                        "page {page}: object {number} at {offset} not in {range:?}",
+                    );
+                }
+                other => panic!("page {page}: object {number} not Normal: {other:?}"),
+            }
+        }
+    }
+
     #[cfg(feature = "inspect")]
     #[test]
     fn first_page_trailer_for_linearized_fixture() {
-        let bytes: &[u8] =
-            include_bytes!("../../beeld-tests/pdfs/custom/andler-optimal-lot-size_linearized.pdf");
+        let bytes: &[u8] = include_bytes!(
+            "../../../beeld-tests/pdfs/custom/andler-optimal-lot-size_linearized.pdf"
+        );
         let pdf = Pdf::new(bytes.to_vec()).expect("linearized fixture loads");
         let trailer = pdf.xref().first_page_trailer().expect("first-page trailer");
         let size: i32 = trailer.get(b"Size").expect("Size");
@@ -392,6 +829,22 @@ mod tests {
         let trailer = pdf.xref().first_page_trailer().expect("ordinary trailer");
         let size: i32 = trailer.get(b"Size").expect("Size");
         assert_eq!(size, 3);
+    }
+
+    /// An xref-*stream*-only file has no `trailer` keyword — its first-page
+    /// trailer *is* the cross-reference stream object's dictionary
+    /// (ISO 32000-2 Annex F.3.4) — so the lexical `trailer`-keyword scan
+    /// finds nothing and `first_page_trailer` returns `None`. This pins the
+    /// documented limitation (see `XRef::first_page_trailer`). The
+    /// `catalog-in-objstm-aes` fixture is such a file: a single `/Type /XRef`
+    /// cross-reference stream, no `trailer` keyword anywhere.
+    #[cfg(feature = "inspect")]
+    #[test]
+    fn first_page_trailer_none_for_xref_stream() {
+        let bytes: &[u8] =
+            include_bytes!("../../../beeld-tests/pdfs/custom/catalog-in-objstm-aes.pdf");
+        let pdf = Pdf::new(bytes.to_vec()).expect("xref-stream fixture loads");
+        assert!(pdf.xref().first_page_trailer().is_none());
     }
 
     /// Build a minimal PDF that carries two xref sections chained via
@@ -485,8 +938,9 @@ mod tests {
     #[cfg(feature = "inspect")]
     #[test]
     fn base_trailer_for_linearized_fixture_differs_from_trailer() {
-        let bytes: &[u8] =
-            include_bytes!("../../beeld-tests/pdfs/custom/andler-optimal-lot-size_linearized.pdf");
+        let bytes: &[u8] = include_bytes!(
+            "../../../beeld-tests/pdfs/custom/andler-optimal-lot-size_linearized.pdf"
+        );
         let pdf = Pdf::new(bytes.to_vec()).expect("linearized fixture loads");
         assert!(pdf.is_linearized());
 
@@ -528,7 +982,7 @@ mod tests {
         use crate::object::String as PdfString;
 
         let bytes: &[u8] =
-            include_bytes!("../../beeld-tests/pdfs/custom/catalog-in-objstm-aes.pdf");
+            include_bytes!("../../../beeld-tests/pdfs/custom/catalog-in-objstm-aes.pdf");
         let pdf = Pdf::new(bytes.to_vec()).expect("xref-stream aes fixture loads");
         assert!(pdf.is_encrypted());
 

@@ -4,12 +4,13 @@ use crate::PdfData;
 use crate::ReadAt;
 use crate::ReadAtError;
 use crate::data::FULL_FALLBACK_MAX;
-use crate::object::{Dict, Object};
+use crate::object::{Dict, Object, ObjectIdentifier};
 use crate::page::Pages;
 use crate::page::cached::CachedPages;
 use crate::reader::Reader;
 use crate::sync::Arc;
-use crate::xref::{XRef, XRefError, fallback, root_xref, root_xref_streamed};
+use crate::xref::{EntryType, XRef, XRefError, fallback, root_xref, root_xref_streamed};
+use core::ops::Range;
 
 pub use crate::crypto::DecryptionError;
 use crate::metadata::Metadata;
@@ -24,6 +25,7 @@ pub struct Pdf {
     #[cfg(feature = "inspect")]
     layout: crate::sync::OnceLock<crate::layout::FileLayout>,
     linearization: crate::sync::OnceLock<crate::linearization::CachedLinearization>,
+    hint_tables: crate::sync::OnceLock<Option<crate::linearization::HintTables>>,
 }
 
 /// An error that occurred while loading a PDF file.
@@ -96,6 +98,7 @@ impl Pdf {
             #[cfg(feature = "inspect")]
             layout: crate::sync::OnceLock::new(),
             linearization: crate::sync::OnceLock::new(),
+            hint_tables: crate::sync::OnceLock::new(),
         })
     }
 
@@ -175,6 +178,7 @@ impl Pdf {
             #[cfg(feature = "inspect")]
             layout: crate::sync::OnceLock::new(),
             linearization: crate::sync::OnceLock::new(),
+            hint_tables: crate::sync::OnceLock::new(),
         })
     }
 
@@ -297,6 +301,293 @@ impl Pdf {
     /// parses successfully.
     pub fn is_linearized(&self) -> bool {
         self.linearization_cached().is_linearized()
+    }
+
+    /// Classify the document's linearization genuineness — the runtime
+    /// validity layer of the three-layer model on [`LinearizationKind`].
+    ///
+    /// The sole demoting check is ISO 32000-2 Table F.1's `/L` rule: the
+    /// declared length must equal the actual file length, else the file is
+    /// not linearized and must be treated as an ordinary PDF (§G.2).
+    /// Returns [`Genuineness::NotLinearized`] when there is no
+    /// successfully-parsed parameter dict (absent or malformed).
+    ///
+    /// The file length is read via [`Self::data`] without materialising a
+    /// streaming source.
+    ///
+    /// [`LinearizationKind`]: crate::linearization::LinearizationKind
+    /// [`Genuineness::NotLinearized`]: crate::linearization::Genuineness::NotLinearized
+    pub fn linearization_genuineness(&self) -> crate::linearization::Genuineness {
+        use crate::linearization::Genuineness;
+        match self.linearization_cached().as_present() {
+            None => Genuineness::NotLinearized,
+            Some(lin) => {
+                let declared = lin.length as u64;
+                let actual = self.data().len();
+                if declared == actual {
+                    Genuineness::Genuine
+                } else {
+                    Genuineness::LengthMismatch { declared, actual }
+                }
+            }
+        }
+    }
+
+    /// Whether the document is *genuinely* linearized: the parameter dict
+    /// parsed and its `/L` equals the actual file length (Table F.1,
+    /// §G.2).
+    ///
+    /// The strongest of the three linearization layers (see
+    /// [`LinearizationKind`]): stronger than [`Self::is_linearized`]
+    /// (which only checks the `/Linearized` claim) and than
+    /// [`Self::linearization`] (which only checks that the dict parsed).
+    /// Only a genuinely-linearized file may be opened at its first page
+    /// without validating the appended-update case.
+    ///
+    /// [`LinearizationKind`]: crate::linearization::LinearizationKind
+    pub fn is_genuinely_linearized(&self) -> bool {
+        matches!(
+            self.linearization_genuineness(),
+            crate::linearization::Genuineness::Genuine
+        )
+    }
+
+    /// The parsed linearization dict, but only when the document is
+    /// genuinely linearized (layer 3 of the [`LinearizationKind`] model).
+    ///
+    /// The gate for the page-1 fast-path accessors below: it ensures no
+    /// byte offset is ever derived from a non-genuine dict — an appended
+    /// update or a forged dict whose `/L` mismatches the file length
+    /// (Table F.1, §G.2), whose offsets may point anywhere.
+    ///
+    /// [`LinearizationKind`]: crate::linearization::LinearizationKind
+    fn genuine_linearization(&self) -> Option<&crate::linearization::Linearization> {
+        if self.is_genuinely_linearized() {
+            self.linearization()
+        } else {
+            None
+        }
+    }
+
+    /// Resolve `/O` (the first page's object number, Table F.1) to its
+    /// cross-reference entry, gated on genuineness. `Some((id, offset))`
+    /// only when the entry is [`EntryType::Normal`]: ISO 32000-2 §F.3.3
+    /// requires the first-page cross-reference section to hold a *normal*
+    /// entry for the first page's object, so a `Compressed`/`Free`/absent
+    /// entry — a forged dict pointing nowhere — yields `None`.
+    fn first_page_object_entry(&self) -> Option<(ObjectIdentifier, u64)> {
+        let lin = self.genuine_linearization()?;
+        let id = ObjectIdentifier::new(lin.first_page_object, 0);
+        match self.xref().entry(id)? {
+            EntryType::Normal { offset } => Some((id, offset as u64)),
+            _ => None,
+        }
+    }
+
+    /// The first page's object identifier (`/O`, Table F.1), when the
+    /// document is genuinely linearized and `/O` resolves to a normal
+    /// cross-reference entry (§F.3.3).
+    ///
+    /// Part of the Fast Web View page-1 fast path (ISO 32000-2 §G.2): a
+    /// streaming consumer can fetch only `[0, first_page_prefix_end())`,
+    /// open that prefix with [`Self::new_with_reader`], and resolve this
+    /// object without reading the file's tail. Returns `None` when the file
+    /// is not genuinely linearized (see [`Self::is_genuinely_linearized`])
+    /// or `/O` has no normal entry.
+    pub fn first_page_object(&self) -> Option<ObjectIdentifier> {
+        Some(self.first_page_object_entry()?.0)
+    }
+
+    /// The offset of the end of the first page (`/E`, Table F.1), relative
+    /// to the beginning of the file, when the document is genuinely
+    /// linearized.
+    ///
+    /// Per ISO 32000-2 §G.2 a reader can render the first page once the
+    /// first `first_page_prefix_end()` bytes have been downloaded: every
+    /// object the first page needs lies within that prefix. Returns `None`
+    /// when the file is not genuinely linearized.
+    pub fn first_page_prefix_end(&self) -> Option<u64> {
+        Some(self.genuine_linearization()?.first_page_end_offset as u64)
+    }
+
+    /// The first page object's own byte span, `[offset(/O), /E)`: from the
+    /// file offset of `/O`'s normal cross-reference entry (§F.3.3) up to the
+    /// end of the first page (`/E`, Table F.1).
+    ///
+    /// Gated exactly as [`Self::first_page_object`] (genuine, and `/O`
+    /// normal). A streaming consumer can pass this range straight to
+    /// [`Self::read_range_cached`] to fetch the first page object. Returns
+    /// `None` when the file is not genuinely linearized or `/O` has no
+    /// normal entry.
+    pub fn first_page_byte_range(&self) -> Option<Range<u64>> {
+        let (_, offset) = self.first_page_object_entry()?;
+        let end = self.genuine_linearization()?.first_page_end_offset as u64;
+        Some(offset..end)
+    }
+
+    /// Cache-backed positioned read of the byte range `[offset, end_bound)`.
+    ///
+    /// For a Fast Web View consumer that has computed a byte range itself —
+    /// e.g. [`Self::first_page_byte_range`] — and wants those bytes without
+    /// materialising the whole file. Routes through the cross-reference
+    /// table's streaming object-window arena (the `Arc<Data>` inside
+    /// [`XRef`](crate::xref::XRef)): a streamed source `pread`s the window
+    /// once and caches it; a resident source copies the sub-slice. The
+    /// returned slice borrows `self`.
+    ///
+    /// The window arena is keyed by `offset`, so the first read at a given
+    /// `offset` fixes the served window's length; a subsequent read at the
+    /// same `offset` returns that first window regardless of `end_bound`.
+    ///
+    /// Returns [`ReadAtError::Pending`] when the range is not yet available
+    /// from a partially-downloaded source — nothing is cached, so a retry
+    /// after more bytes land re-reads — or [`ReadAtError::Io`] on a genuine
+    /// source failure.
+    pub fn read_range_cached(&self, offset: u64, end_bound: u64) -> Result<&[u8], ReadAtError> {
+        self.xref().read_window_cached(offset, end_bound)
+    }
+
+    /// The document's decoded hint tables (ISO 32000-2 Annex F.4), decoded
+    /// once and cached.
+    ///
+    /// Returns `None` when the document is not genuinely linearized (see
+    /// [`Self::is_genuinely_linearized`]), when `/H` is unavailable, when the
+    /// primary hint stream cannot be located, fetched or decoded, or when a
+    /// table fails to decode — in every case a caller falls back to the page
+    /// tree. The tables let a Fast Web View consumer locate an arbitrary
+    /// page's object number and byte range without the page tree:
+    /// [`HintTables::page_object_number`](crate::linearization::HintTables::page_object_number)
+    /// and
+    /// [`HintTables::page_byte_range`](crate::linearization::HintTables::page_byte_range).
+    ///
+    /// Only a *permanent* outcome is memoized. When a hint stream's bytes are
+    /// not yet available from a partially-downloaded source — a
+    /// [`ReadAtError::Pending`] window (ISO 32000-2 §G.2) — this returns `None`
+    /// **without** caching, so a later call re-decodes once the bytes land
+    /// rather than latching the transient miss forever.
+    pub fn hint_tables(&self) -> Option<&crate::linearization::HintTables> {
+        // Fast path: a permanent outcome (decoded tables, or a permanent
+        // absence) was memoized on a previous call.
+        if let Some(cached) = self.hint_tables.get() {
+            return cached.as_ref();
+        }
+        match self.decode_hint_tables() {
+            Ok(tables) => {
+                // First writer wins a race; a concurrent thread may already
+                // have set an equal permanent value. Read back through the
+                // cell so the returned reference lives in the `OnceLock`.
+                let _ = self.hint_tables.set(tables);
+                self.hint_tables.get().and_then(Option::as_ref)
+            }
+            // A transient positioned-read failure on a hint stream's window
+            // (`Pending` — bytes not yet downloaded; or `Io`): do not memoize,
+            // so the next call retries once more of the source has landed. This
+            // mirrors the object layer, which resolves such a window to the
+            // null object uncached (see `XRef::get_with`).
+            Err(_) => None,
+        }
+    }
+
+    /// Locate, fetch and decode the primary (and any overflow) hint stream.
+    /// The cached backing of [`Self::hint_tables`].
+    ///
+    /// `Ok(None)` is a *permanent* absence of hint tables — not genuinely
+    /// linearized, `/H` absent, the hint stream cannot be located, or it
+    /// decodes to nothing — which [`Self::hint_tables`] memoizes. `Err` is a
+    /// *transient* positioned-read failure on a hint stream's window — a
+    /// not-yet-downloaded [`ReadAtError::Pending`] window on a partial Fast Web
+    /// View source, or an [`ReadAtError::Io`] — which it does not, so the
+    /// decode is retried once the source serves more bytes.
+    fn decode_hint_tables(&self) -> Result<Option<crate::linearization::HintTables>, ReadAtError> {
+        use crate::linearization::HintTables;
+        use crate::object::Stream;
+
+        // Gate on genuineness: never derive a hint offset from a dict whose
+        // `/L` mismatches the file length (Table F.1, §G.2).
+        let Some(lin) = self.genuine_linearization() else {
+            return Ok(None);
+        };
+        let Some(offsets) = lin.hint_offsets.as_ref() else {
+            return Ok(None);
+        };
+        let Some(primary_off) = offsets.first().and_then(|off| u64::try_from(*off).ok()) else {
+            return Ok(None);
+        };
+
+        // `/H[0]` is the offset of the hint stream *object* (Table F.1), i.e. a
+        // `Normal` cross-reference entry.
+        let Some(primary_id) = self.xref_id_at_offset(primary_off) else {
+            return Ok(None);
+        };
+
+        // Distinguish a transient not-yet-downloaded window from a permanent
+        // decode failure: probe the primary hint stream object's window before
+        // fetching it. On a partial Fast Web View download the bytes may not
+        // have arrived, in which case the object path below would resolve the
+        // stream to the null object — a `None` indistinguishable from a real
+        // decode failure that `hint_tables` would then memoize forever.
+        // Surfacing Pending/Io here keeps the not-yet-available result out of
+        // the cache so a later call re-decodes (ISO 32000-2 §G.2 retry).
+        self.xref().object_window_status(primary_id)?;
+
+        // Fetch through the ordinary object path (window-cached + decrypted).
+        let Some(stream) = self.xref().get::<Stream<'_>>(primary_id) else {
+            return Ok(None);
+        };
+        let Ok(decoded) = stream.decoded() else {
+            return Ok(None);
+        };
+        let mut data = decoded.into_owned();
+
+        // An overflow hint stream (the four-integer `/H` form) is concatenated
+        // seamlessly onto the primary stream (F.3.6/F.4.1). `offsets.get(2)` is
+        // `Some` only for that arity (parsing enforces `/H` ∈ {2, 4} integers).
+        // It typically lives at the file tail, so on a partial download it is
+        // the likelier of the two to be `Pending`; guard it with the same probe
+        // so a primary-only (incomplete) decode is never memoized while the
+        // overflow is still in flight. A genuinely absent or undecodable
+        // overflow (no object at the offset, or a non-stream) stays best-effort:
+        // the primary data stands.
+        if let Some(overflow_id) = offsets
+            .get(2)
+            .and_then(|off| u64::try_from(*off).ok())
+            .and_then(|off| self.xref_id_at_offset(off))
+        {
+            self.xref().object_window_status(overflow_id)?;
+            if let Some(overflow) = self
+                .xref()
+                .get::<Stream<'_>>(overflow_id)
+                .and_then(|stream| stream.decoded().ok())
+            {
+                data.extend_from_slice(&overflow);
+            }
+        }
+
+        // `/S` (Table F.2, Required) is the byte offset of the shared object
+        // hint table within the concatenated stream data.
+        let Some(shared) = stream.dict().get::<i64>(b"S") else {
+            return Ok(None);
+        };
+        let Ok(shared_offset) = usize::try_from(shared) else {
+            return Ok(None);
+        };
+        let Ok(page_count) = usize::try_from(lin.page_count) else {
+            return Ok(None);
+        };
+        Ok(HintTables::decode(&data, shared_offset, page_count))
+    }
+
+    /// The identifier of the `Normal` cross-reference entry whose byte offset
+    /// equals `offset`, if any — used to resolve a `/H` hint-stream offset to
+    /// its object.
+    fn xref_id_at_offset(&self, offset: u64) -> Option<ObjectIdentifier> {
+        self.xref()
+            .entries()
+            .into_iter()
+            .find_map(|(id, entry)| match entry {
+                EntryType::Normal { offset: o } if o as u64 == offset => Some(id),
+                _ => None,
+            })
     }
 
     /// Compute the file-level physical layout.
@@ -619,6 +910,181 @@ mod tests {
             read < bytes.len() as u64,
             "multi-section streaming open read {read} of {} bytes - expected bounded reads, not a resident fallback",
             bytes.len(),
+        );
+    }
+
+    /// Fast Web View page-1 fast path (ISO 32000-2 §G.2, design §3.1): the
+    /// genuine-gated `/O`+`/E` accessors and the cache-backed positioned read
+    /// must agree across a resident open and a streamed open of the same
+    /// linearized fixture, and yield the first page object's bytes without
+    /// materialising the whole file.
+    #[test]
+    fn first_page_range_streamed() {
+        let bytes: &[u8] =
+            include_bytes!("../../beeld-tests/pdfs/custom/andler-optimal-lot-size_linearized.pdf");
+
+        let resident = Pdf::new(bytes.to_vec()).expect("resident linearized loads");
+        let streamed =
+            Pdf::new_with_reader(SliceReadAt(bytes.to_vec())).expect("streamed linearized loads");
+        assert!(
+            streamed.data().is_streamed(),
+            "the linearized fixture must take the streamed open path",
+        );
+
+        // Fixture header: `/O 180 /E 88106`. Object 180 is the first page's page
+        // object, at file offset 83298. Both opens derive the same values from
+        // the parsed xref + lin dict, without reading the file's tail.
+        let want_id = crate::object::ObjectIdentifier::new(180, 0);
+        assert_eq!(resident.first_page_object(), Some(want_id));
+        assert_eq!(streamed.first_page_object(), Some(want_id));
+        assert_eq!(resident.first_page_prefix_end(), Some(88106));
+        assert_eq!(streamed.first_page_prefix_end(), Some(88106));
+
+        let range = resident
+            .first_page_byte_range()
+            .expect("resident first-page range");
+        assert_eq!(range, 83298..88106);
+        assert_eq!(streamed.first_page_byte_range(), Some(range.clone()));
+
+        // A resident source never touches the object-window arena on the object
+        // path (it lexes from the whole-file buffer), so read_range_cached
+        // first-touches the window at exactly [offset(/O), /E) and returns that
+        // whole span verbatim.
+        let resident_range = resident
+            .read_range_cached(range.start, range.end)
+            .expect("resident cached read");
+        assert_eq!(
+            resident_range,
+            &bytes[range.start as usize..range.end as usize],
+        );
+        assert!(resident_range.starts_with(b"180 0 obj"));
+
+        // The streamed open already first-touched object /O (a page-tree kid)
+        // with an object-sized window bounded at the next object, so the
+        // offset-keyed arena serves that window here: a non-empty, byte-for-byte
+        // consistent prefix of the resident span, starting at the /O object
+        // header - i.e. the cache-backed read returns the first page object's
+        // bytes from the streamed source, no whole-file materialisation.
+        let streamed_range = streamed
+            .read_range_cached(range.start, range.end)
+            .expect("streamed cached read");
+        assert!(!streamed_range.is_empty());
+        assert!(streamed_range.starts_with(b"180 0 obj"));
+        assert!(
+            resident_range.starts_with(streamed_range),
+            "streamed cache-backed read must be a byte-consistent prefix of the resident span",
+        );
+    }
+
+    /// A hint-table decode that hits a not-yet-downloaded (`Pending`) hint
+    /// stream window must NOT be memoized: `hint_tables()` yields `None` while
+    /// the primary hint stream's bytes are withheld, then decodes successfully
+    /// once the source serves them. Regression for the
+    /// `OnceLock<Option<HintTables>>` that latched a transient `Pending` miss
+    /// forever, disabling the page-N hint path for the whole `Pdf` instance
+    /// (design §3, ISO 32000-2 §G.2 partial-prefix retry).
+    #[test]
+    fn hint_tables_pending_is_not_latched() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let bytes: &[u8] =
+            include_bytes!("../../beeld-tests/pdfs/custom/andler-optimal-lot-size_linearized.pdf");
+
+        // Resident open: discover the primary hint stream's byte extent from
+        // the parsed `/H`, and the permanent decode's shape to compare against.
+        let resident = Pdf::new(bytes.to_vec()).expect("resident linearized loads");
+        let offsets = resident
+            .linearization()
+            .expect("parsed linearization")
+            .hint_offsets
+            .clone()
+            .expect("/H present");
+        let primary_off = offsets[0] as u64;
+        let primary_len = offsets[1] as u64;
+        let want_pages = resident
+            .hint_tables()
+            .expect("resident hint tables decode")
+            .page_offset
+            .pages
+            .len();
+        assert!(
+            want_pages >= 1,
+            "fixture has at least one page-offset entry"
+        );
+
+        /// Serves the fixture, but reports the primary hint stream's window as
+        /// not-yet-available (`Pending`) while `gated` is set — a partial Fast
+        /// Web View download whose front (lin dict, page tree, xref) has landed
+        /// but whose hint stream has not. Only reads *starting* inside the hint
+        /// stream's own span are gated, so the open and the page-1 fast path
+        /// (all at lower offsets) are unaffected.
+        struct HintGate {
+            data: Vec<u8>,
+            gate: core::ops::Range<u64>,
+            gated: std::sync::Arc<AtomicBool>,
+        }
+        impl crate::ReadAt for HintGate {
+            fn len(&self) -> u64 {
+                self.data.len() as u64
+            }
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, crate::ReadAtError> {
+                if self.gated.load(Ordering::SeqCst) && self.gate.contains(&offset) {
+                    return Err(crate::ReadAtError::Pending);
+                }
+                let start = (offset as usize).min(self.data.len());
+                let avail = &self.data[start..];
+                let n = avail.len().min(buf.len());
+                buf[..n].copy_from_slice(&avail[..n]);
+                Ok(n)
+            }
+        }
+
+        let gated = std::sync::Arc::new(AtomicBool::new(false));
+        let streamed = Pdf::new_with_reader(HintGate {
+            data: bytes.to_vec(),
+            gate: primary_off..primary_off + primary_len,
+            gated: gated.clone(),
+        })
+        .expect("streamed linearized loads");
+        assert!(
+            streamed.data().is_streamed(),
+            "the linearized fixture must take the streamed open path",
+        );
+
+        // Withhold the hint stream's bytes. The open already succeeded and the
+        // page-1 fast path (front of the file) is unaffected — only the hint
+        // stream is Pending.
+        gated.store(true, Ordering::SeqCst);
+        assert!(
+            streamed.is_genuinely_linearized(),
+            "genuineness derives from the front-of-file lin dict + /L, not the hint stream",
+        );
+        assert_eq!(
+            streamed.first_page_object(),
+            resident.first_page_object(),
+            "the page-1 fast path is unaffected by a withheld hint stream",
+        );
+        assert!(
+            streamed.hint_tables().is_none(),
+            "a not-yet-downloaded hint stream must yield None (Pending), not a decode",
+        );
+        // The crux: the transient miss was NOT memoized — a repeated call while
+        // still Pending stays None (it re-attempts rather than serving a cache).
+        assert!(
+            streamed.hint_tables().is_none(),
+            "a repeated call while still Pending stays None",
+        );
+
+        // Source now serving the hint stream: the previously-Pending decode
+        // must now succeed, proving the earlier None was never cached.
+        gated.store(false, Ordering::SeqCst);
+        let tables = streamed
+            .hint_tables()
+            .expect("hint tables decode once the hint stream's bytes land");
+        assert_eq!(
+            tables.page_offset.pages.len(),
+            want_pages,
+            "the re-decode after the bytes land matches the resident decode",
         );
     }
 

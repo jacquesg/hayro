@@ -386,12 +386,14 @@ impl Data {
         // not truncated and silently resolved to the null object. `read_window`
         // reads in bounded chunks, so trusting a large span never forces a giant
         // eager `vec![0; len]` and an over-reported length still cannot amplify: the
-        // allocation tracks the bytes actually served. A genuine source failure
-        // is surfaced as `Err` (distinct from a window that reads but parses
-        // wrongly) and NOT cached as an empty window, so the caller resolves just
-        // this object to the null object (ISO 32000-1 §7.3.10) and retries later,
-        // rather than escalating one transient read to a whole-file repair. Only
-        // a successful read populates the slot.
+        // allocation tracks the bytes actually served. A source error - a hard
+        // `ReadAtError::Io`, or a `ReadAtError::Pending` window not yet available
+        // in a partial download - is surfaced as `Err` (distinct from a window
+        // that reads but parses wrongly) and NOT cached, so the caller resolves
+        // just this object to the null object (ISO 32000-1 §7.3.10) and retries
+        // later (once more of the source lands, for `Pending`), rather than
+        // escalating one transient read to a whole-file repair. Only a successful
+        // read populates the slot.
         let (want, growth) = window_len(offset, end_bound, self.data.len());
         let bytes = read_window(&self.data, offset, want, growth)?;
         Ok(self.windows.get_or_init(idx, || bytes).as_slice())

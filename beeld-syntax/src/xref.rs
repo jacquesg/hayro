@@ -19,9 +19,11 @@ use crate::pdf::PdfVersion;
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt};
 use crate::sync::{Arc, FxHashMap, RwLock, RwLockExt};
+#[cfg(feature = "inspect")]
+use crate::trivia::is_regular_character;
 use crate::trivia::is_white_space_character;
 use crate::util::findr_needle;
-use crate::{PdfData, object};
+use crate::{PdfData, ReadAtError, object};
 use alloc::collections::BTreeSet;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -503,8 +505,9 @@ impl XRef {
     }
 
     /// Return the trailer dictionary immediately preceding the first
-    /// `%%EOF` marker in the file — the last `trailer` keyword before
-    /// that marker.
+    /// `%%EOF` marker in the file — the last `trailer` **keyword** before
+    /// that marker (matched only where it stands as a token, not as a
+    /// substring inside a string or stream body).
     ///
     /// In a linearized document this is the first-page trailer, which
     /// sits below the first-page cross-reference table ahead of the
@@ -520,8 +523,24 @@ impl XRef {
     /// updated file it is **not** the same dict as [`XRef::trailer`],
     /// which follows the final `startxref` to the newest revision.
     ///
-    /// Returns `None` for dummy xrefs, or when no `%%EOF` or preceding
-    /// `trailer` keyword can be located.
+    /// # Limitations
+    ///
+    /// This is a lexical scan for the `trailer` keyword, so it only finds
+    /// the trailer of a standard or hybrid cross-reference **table**. A
+    /// file whose first-page section uses a cross-reference **stream**
+    /// exclusively — permitted for linearized files since PDF 1.5
+    /// (ISO 32000-2 Annex F.3.4) — has no `trailer` keyword: its
+    /// first-page trailer *is* the xref stream object's dictionary. For
+    /// such a file this method returns `None` (or, should an earlier
+    /// table's `trailer` keyword fall before the first `%%EOF`, that
+    /// table's dict). Obtain trailer state for the xref-stream case from
+    /// the parsed cross-reference instead — or, for the tail/main
+    /// section, from [`Self::base_trailer`], which reads an xref stream's
+    /// dictionary directly.
+    ///
+    /// Returns `None` for dummy xrefs, for an xref-stream-only first-page
+    /// section, or when no `%%EOF` or preceding `trailer` keyword can be
+    /// located.
     ///
     /// Requires the `inspect` feature because it uses `FileLayout`
     /// EOF offsets.
@@ -541,7 +560,7 @@ impl XRef {
         // Within [0, first_eof), find the last `trailer` keyword.
         let scan_area = data.get(..first_eof)?;
         let trailer_keyword = b"trailer";
-        let trailer_rel = rfind_subslice(scan_area, trailer_keyword)?;
+        let trailer_rel = rfind_keyword(scan_area, trailer_keyword)?;
         let dict_start = trailer_rel + trailer_keyword.len();
         let mut reader = Reader::new(data);
         reader.jump(dict_start);
@@ -1054,6 +1073,84 @@ impl XRef {
         self.get_with(id, &ctx)
     }
 
+    /// Cache-backed positioned read of the byte window `[offset, end_bound)`
+    /// through the streaming object-window arena.
+    ///
+    /// Routes to [`Data::object_window`], so the returned slice lives in the
+    /// `Arc<Data>` arena and is valid for `&self`: a streamed source `pread`s
+    /// the window once and caches it (no whole-file materialisation, unlike
+    /// borrowing [`PdfData::as_ref`]); a resident source copies the
+    /// sub-slice. A dummy xref has no data and yields an empty slice.
+    ///
+    /// Backs [`Pdf::read_range_cached`](crate::Pdf::read_range_cached), where
+    /// the intended Fast Web View consumer use is documented. A genuine
+    /// source failure ([`ReadAtError::Io`]) and a not-yet-downloaded window
+    /// ([`ReadAtError::Pending`]) are both propagated uncached, so a retry
+    /// after more of the source lands re-reads.
+    pub(crate) fn read_window_cached(
+        &self,
+        offset: u64,
+        end_bound: u64,
+    ) -> Result<&[u8], ReadAtError> {
+        match &self.0 {
+            Inner::Some(r) => r.data.object_window(offset, end_bound),
+            Inner::Dummy => Ok(&[]),
+        }
+    }
+
+    /// Probe whether the streamed byte window backing object `id` is
+    /// available, reading the *same* offset and end bound the object path
+    /// ([`Self::get_with`]) uses — so a success caches exactly the window that
+    /// later `get_with` reuses (never a poisoning short window, since the
+    /// arena serves the first-cached window for an offset regardless of a
+    /// later `end_bound`) and a transient failure caches nothing.
+    ///
+    /// Returns `Ok(())` when the bytes are present, when the source is
+    /// resident, when the table has already been repaired (both are served
+    /// without a positioned read), or when `id` is absent or not a `Normal`
+    /// object — the cases `get_with` resolves without a window read that can
+    /// report [`ReadAtError::Pending`]. Returns `Err(ReadAtError::Pending)`
+    /// (bytes within the source's reported length but not yet delivered by a
+    /// partial Fast Web View download) or `Err(ReadAtError::Io)` when that
+    /// window read fails, exactly as [`Self::read_window_cached`] would.
+    ///
+    /// A memoising caller — [`Pdf::hint_tables`](crate::Pdf::hint_tables) —
+    /// uses this to tell a transient not-yet-downloaded hint stream (which the
+    /// Option-typed object path would otherwise collapse to a `None`
+    /// indistinguishable from a permanent decode failure) from a genuinely
+    /// undecodable one, so it never latches a not-yet-available result.
+    pub(crate) fn object_window_status(&self, id: ObjectIdentifier) -> Result<(), ReadAtError> {
+        let Inner::Some(repr) = &self.0 else {
+            return Ok(());
+        };
+        // Snapshot the entry and the `repaired` flag under the same lock as
+        // `get_with`, so the routing below sees a consistent view.
+        let (entry, repaired) = {
+            let locked = repr.map.get();
+            match locked.xref_map.get(&id) {
+                Some(entry) => (*entry, locked.repaired),
+                // An undefined object resolves to the null object
+                // (ISO 32000-1 §7.3.10) without a positioned read — never
+                // Pending.
+                None => return Ok(()),
+            }
+        };
+        // Only a streamed, not-yet-repaired `Normal` object is served by a
+        // positioned window read that can report Pending/Io; every other case
+        // (resident buffer, repaired-and-materialised table, free/compressed
+        // entry) is resolved by `get_with` without one.
+        if repaired || !repr.data.get().is_streamed() {
+            return Ok(());
+        }
+        let EntryType::Normal { offset } = entry else {
+            return Ok(());
+        };
+        let end_bound = repr.next_object_bound(offset);
+        repr.data
+            .object_window(offset as u64, end_bound)
+            .map(|_| ())
+    }
+
     /// Return the object with the given identifier.
     #[allow(private_bounds)]
     pub(crate) fn get_with<'a, T>(
@@ -1122,13 +1219,17 @@ impl XRef {
                         }
                         Err(_) => {
                             // A transient positioned-read failure on THIS object's
-                            // window - not a parse failure. Resolve just this
-                            // object to the null object (ISO 32000-1 §7.3.10) and
-                            // leave the good streamed table intact, rather than
-                            // escalating one flaky read to a whole-file repair
-                            // (which would discard streaming for every object).
-                            // The failed read was not cached, so a later lookup
-                            // retries it.
+                            // window - not a parse failure. This covers both a
+                            // hard `ReadAtError::Io` and a `ReadAtError::Pending`
+                            // (bytes not yet downloaded in a partial Fast Web View
+                            // fetch): neither is a wrong offset, so neither must
+                            // trigger `repair`. Resolve just this object to the
+                            // null object (ISO 32000-1 §7.3.10) and leave the good
+                            // streamed table intact, rather than escalating one
+                            // flaky read to a whole-file repair (which would
+                            // discard streaming for every object). The failed read
+                            // was not cached, so a later lookup - after more of the
+                            // source lands, for `Pending` - retries it.
                             return None;
                         }
                     }
@@ -1277,16 +1378,27 @@ pub(crate) enum XRefInput<'a> {
     RootRef(ObjectIdentifier),
 }
 
-/// Return the byte offset of the last occurrence of `needle` in
-/// `haystack`, or `None` if not present.
+/// Reverse-search for `needle` as a standalone PDF token: the match must
+/// be bounded on both sides by a token boundary — a white-space or
+/// delimiter character, or the edge of `haystack` — so a `needle`
+/// occurring as a substring of a larger token (e.g. within a string or
+/// stream body) is skipped. Returns the byte offset of the last such
+/// match. A byte is a token boundary exactly when it is not a regular
+/// character (ISO 32000-1 §7.2.2, Tables 1–2).
 #[cfg(feature = "inspect")]
-fn rfind_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+fn rfind_keyword(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    (0..=haystack.len() - needle.len())
-        .rev()
-        .find(|&i| &haystack[i..i + needle.len()] == needle)
+    (0..=haystack.len() - needle.len()).rev().find(|&i| {
+        if &haystack[i..i + needle.len()] != needle {
+            return false;
+        }
+        let before_ok = i == 0 || !is_regular_character(haystack[i - 1]);
+        let after = i + needle.len();
+        let after_ok = after == haystack.len() || !is_regular_character(haystack[after]);
+        before_ok && after_ok
+    })
 }
 
 pub(crate) fn find_last_xref_pos(data: &[u8]) -> Option<usize> {
@@ -3676,6 +3788,101 @@ mod tests {
                 .and_then(|d| d.get::<i32>(b"Good")),
             Some(1),
             "the failed read was not cached; a retry must resolve the object",
+        );
+    }
+
+    /// The Fast Web View not-yet-available signal (design §3.3): a
+    /// `ReadAtError::Pending` window (bytes within the source's reported
+    /// length but not yet delivered by a partial download) must PROPAGATE
+    /// through the cache-backed read [`XRef::read_window_cached`] uncached,
+    /// and must resolve a legacy Option-typed [`XRef::get`] to the null
+    /// object (ISO 32000-1 §7.3.10) WITHOUT triggering `repair` - a `Pending`
+    /// is transient, not a wrong offset. Once the source serves the bytes a
+    /// retry re-reads (nothing was cached) and both APIs succeed.
+    #[test]
+    fn pending_propagates() {
+        use crate::read_at::{ReadAt, ReadAtError};
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (content, locs, file_len) = streamed_repair_fixture(0);
+        let off3 = locs[2] as u64;
+        // Object 3 (`<< /Good 1 >>`) is standalone: the empty-Kids page tree
+        // never references it, so the streamed open leaves its window uncached
+        // and it is read only on an explicit lookup.
+        let obj3: &[u8] = b"3 0 obj\n<< /Good 1 >>\nendobj\n";
+        let end3 = off3 + obj3.len() as u64;
+        assert_eq!(
+            &content[locs[2]..locs[2] + obj3.len()],
+            obj3,
+            "fixture object 3 has the expected extent",
+        );
+
+        /// Serves `content`, but returns `Pending` for every read while `gated`
+        /// is set - a partial download that has not yet delivered the bytes.
+        struct PendingGate {
+            content: Vec<u8>,
+            gated: StdArc<AtomicBool>,
+        }
+        impl ReadAt for PendingGate {
+            fn len(&self) -> u64 {
+                self.content.len() as u64
+            }
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, ReadAtError> {
+                if self.gated.load(Ordering::SeqCst) {
+                    return Err(ReadAtError::Pending);
+                }
+                let start = usize::try_from(offset)
+                    .unwrap_or(usize::MAX)
+                    .min(self.content.len());
+                let n = (self.content.len() - start).min(buf.len());
+                buf[..n].copy_from_slice(&self.content[start..start + n]);
+                Ok(n)
+            }
+        }
+
+        // Open with the gate OPEN so the streamed parse succeeds; object 3 is
+        // untouched by the open.
+        let gated = StdArc::new(AtomicBool::new(false));
+        let data = PdfData::streamed(PendingGate {
+            content,
+            gated: gated.clone(),
+        });
+        let xref = root_xref_streamed(data, b"", file_len).expect("fixture opens streamed");
+        let id = ObjectIdentifier::new(3, 0);
+
+        // Close the gate: reads now report the bytes as not-yet-available.
+        gated.store(true, Ordering::SeqCst);
+
+        // The cache-backed read PROPAGATES Pending (not Io, not an empty Ok).
+        assert_eq!(
+            xref.read_window_cached(off3, end3),
+            Err(ReadAtError::Pending),
+            "a not-yet-available window must surface as Pending, uncached",
+        );
+        // The legacy lookup resolves the object to the null object and must NOT
+        // repair - a Pending is transient, not a wrong offset.
+        assert!(
+            xref.get::<Dict<'_>>(id).is_none(),
+            "a Pending window resolves the object to the null object for this lookup",
+        );
+        assert!(
+            !xref.is_repaired(),
+            "a Pending window must NOT escalate to a whole-file repair",
+        );
+
+        // Source now serving: nothing was cached, so a retry re-reads and both
+        // the cache-backed read and the legacy lookup succeed.
+        gated.store(false, Ordering::SeqCst);
+        assert_eq!(
+            xref.read_window_cached(off3, end3),
+            Ok(obj3),
+            "once the bytes land, the previously-Pending window re-reads",
+        );
+        assert_eq!(
+            xref.get::<Dict<'_>>(id).and_then(|d| d.get::<i32>(b"Good")),
+            Some(1),
+            "the object resolves after the bytes land",
         );
     }
 
