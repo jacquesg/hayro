@@ -13,10 +13,10 @@ ignore = [
   # regression renderer, a dev-dep of beeld-tests (its suite is not run in CI).
   { id = "RUSTSEC-2023-0018", reason = "remove_dir_all TOCTOU; via sitro/tempdir, dev-only test tooling" },
   { id = "RUSTSEC-2018-0017", reason = "tempdir deprecated; via sitro, dev-only test tooling" },
-  # ttf-parser unmaintained (not a vulnerability) <- resvg/usvg/fontdb/rustybuzz,
+  # ttf-parser unmaintained (not a vulnerability) <- svgraster/svgir/fontdb/rustybuzz,
   # reaching only the non-published beeld-tests harness (SVG comparison). Same
   # waiver as bladsy/moegoe; beeld's own font stack is skrifa.
-  { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained; transitive via resvg/usvg into the non-published test harness only" },
+  { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained; transitive via svgraster/svgir into the non-published test harness only" },
 ]
 
 [licenses]
@@ -46,4 +46,6 @@ unknown-git = "deny"
 allow-git = [
   "https://github.com/LaurenzV/sitro",
   "https://github.com/linebender/vello",
+  # beeld's hard fork of resvg/usvg (renamed svgraster/svgir), tracked on main.
+  "ssh://git@git.bloudraad.io/bloudraad/svgraster.git",
 ]

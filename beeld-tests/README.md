@@ -47,7 +47,7 @@ Once the snapshots have been refreshed, run the tests again (without `REPLACE`) 
 There are currently four different categories of tests:
 - Load tests: They ensure that a file can be loaded/rendered without crashing. Those tests should ideally be run in debug mode.
 - Render tests: This category makes up the bulk and ensures that PDF render correctly.
-- SVG tests: Those tests are for testing `beeld-svg` by rendering the resulting SVGs with `resvg`.
+- SVG tests: Those tests are for testing `beeld-svg` by rendering the resulting SVGs with `svgraster`.
 - Write tests: Those are for the `beeld-write` crate, which is considered internal. You can ignore those.
 
 ## Other

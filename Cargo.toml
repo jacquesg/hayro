@@ -43,7 +43,7 @@ bytemuck = { version = "1" }
 image = { version = "0.25", default-features = false }
 kurbo = { version = "0.13.0" }
 log = { version = "0.4" }
-resvg = { version = "0.47.0" }
+svgraster = { git = "ssh://git@git.bloudraad.io/bloudraad/svgraster.git", branch = "main" }
 flate2 = { version = "1" }
 phf = { version = "0.13.1", default-features = false }
 moxcms = { version = "0.8.1" }

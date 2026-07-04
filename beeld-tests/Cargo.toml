@@ -28,7 +28,7 @@ beeld-jbig2 = { workspace = true }
 beeld-jpeg2000 = { workspace = true, features = ["image"] }
 pdf-writer = { workspace = true }
 image = { workspace = true, default-features = false}
-resvg = { workspace = true }
+svgraster = { workspace = true }
 walkdir = "2"
 rayon = "1.11"
 memchr = { version = "2.7.6"}

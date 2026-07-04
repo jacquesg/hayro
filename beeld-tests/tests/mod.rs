@@ -5,13 +5,13 @@ use beeld_svg::SvgRenderSettings;
 use beeld_syntax::Pdf;
 use beeld_syntax::{DecryptionError, LoadPdfError};
 use image::{Rgba, RgbaImage, load_from_memory};
-use resvg::tiny_skia::{Color, Pixmap, PixmapPaint};
-use resvg::usvg::{Options, Transform, Tree};
 use sitro::{RenderOptions, Renderer};
 use std::cmp::max;
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
+use svgraster::svgir::{Options, Transform, Tree};
+use svgraster::tiny_skia::{Color, Pixmap, PixmapPaint};
 
 #[rustfmt::skip]
 #[allow(non_snake_case)]
@@ -309,7 +309,7 @@ fn render_svg(
                 tree.size().height().ceil() as u32,
             )
             .unwrap();
-            resvg::render(&tree, Transform::default(), &mut rendered.as_mut());
+            svgraster::render(&tree, Transform::default(), &mut rendered.as_mut());
 
             // A workaround for https://github.com/linebender/resvg/issues/1069
             let mut composited = Pixmap::new(rendered.width(), rendered.height()).unwrap();
