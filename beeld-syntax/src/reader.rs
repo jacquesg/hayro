@@ -118,6 +118,14 @@ struct ReaderContextData<'a> {
     xref: &'a XRef,
     in_content_stream: bool,
     in_object_stream: bool,
+    // `true` once reading descends into a buffer whose byte offsets do NOT
+    // map to positions in the original PDF file: a decoded object stream, a
+    // streamed-object window, or a fresh sub-reader over a dict value /
+    // array element. `Name::byte_range` is `None` for names lexed under a
+    // detached context, since their recorded offset would otherwise be a
+    // misleading position against an ephemeral buffer the caller cannot
+    // identify.
+    detached: bool,
     obj_number: Option<ObjectIdentifier>,
     parent_chain: SmallVec<[ObjectIdentifier; 8]>,
 }
@@ -125,7 +133,10 @@ struct ReaderContextData<'a> {
 #[derive(Clone, Debug)]
 enum ReaderContextInner<'a> {
     Shared(Arc<ReaderContextData<'a>>),
-    Dummy { in_content_stream: bool },
+    Dummy {
+        in_content_stream: bool,
+        detached: bool,
+    },
 }
 
 /// Context for reading PDF objects.
@@ -139,6 +150,7 @@ impl<'a> ReaderContext<'a> {
             in_content_stream,
             obj_number: None,
             in_object_stream: false,
+            detached: false,
             parent_chain: smallvec![],
         })))
     }
@@ -146,12 +158,14 @@ impl<'a> ReaderContext<'a> {
     pub fn dummy() -> Self {
         Self(ReaderContextInner::Dummy {
             in_content_stream: false,
+            detached: false,
         })
     }
 
     pub(crate) fn dummy_ref() -> &'static Self {
         &Self(ReaderContextInner::Dummy {
             in_content_stream: true,
+            detached: false,
         })
     }
 
@@ -167,7 +181,9 @@ impl<'a> ReaderContext<'a> {
     pub(crate) fn in_content_stream(&self) -> bool {
         match &self.0 {
             ReaderContextInner::Shared(inner) => inner.in_content_stream,
-            ReaderContextInner::Dummy { in_content_stream } => *in_content_stream,
+            ReaderContextInner::Dummy {
+                in_content_stream, ..
+            } => *in_content_stream,
         }
     }
 
@@ -176,6 +192,28 @@ impl<'a> ReaderContext<'a> {
         match &self.0 {
             ReaderContextInner::Shared(inner) => inner.in_object_stream,
             ReaderContextInner::Dummy { .. } => false,
+        }
+    }
+
+    /// Whether reading has descended into a buffer whose byte offsets do
+    /// not map to file positions (see [`ReaderContextData::detached`]).
+    /// A dummy context starts non-detached — a caller reading a free-standing
+    /// slice owns that buffer and its offsets are meaningful to it — but,
+    /// like a shared one, is marked detached when reading descends into a
+    /// fresh sub-reader over a dict value or array element.
+    #[inline]
+    pub(crate) fn detached(&self) -> bool {
+        match &self.0 {
+            ReaderContextInner::Shared(inner) => inner.detached,
+            ReaderContextInner::Dummy { detached, .. } => *detached,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn set_detached(&mut self, val: bool) {
+        match &mut self.0 {
+            ReaderContextInner::Shared(inner) => Arc::make_mut(inner).detached = val,
+            ReaderContextInner::Dummy { detached, .. } => *detached = val,
         }
     }
 
@@ -199,7 +237,9 @@ impl<'a> ReaderContext<'a> {
     pub(crate) fn set_in_content_stream(&mut self, val: bool) {
         match &mut self.0 {
             ReaderContextInner::Shared(inner) => Arc::make_mut(inner).in_content_stream = val,
-            ReaderContextInner::Dummy { in_content_stream } => *in_content_stream = val,
+            ReaderContextInner::Dummy {
+                in_content_stream, ..
+            } => *in_content_stream = val,
         }
     }
 

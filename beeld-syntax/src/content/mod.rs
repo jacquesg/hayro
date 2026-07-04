@@ -219,6 +219,20 @@ impl<'a> UntypedIter<'a> {
                             }
 
                             let end_offset = self.reader.offset() - start_offset;
+                            // `image_data` runs up to the `E` of `EI`, so it still
+                            // includes the white-space that delimits the image data
+                            // from `EI`. ISO 32000-2 §8.9.7 mandates a single
+                            // white-space only AFTER `ID` (already consumed above);
+                            // the pre-`EI` delimiter is OPTIONAL (§8.9.7 NOTE 2) and
+                            // /Length excludes it. That trailing byte is
+                            // deliberately NOT trimmed here: the body is raw filtered
+                            // bytes, and without consulting /Length (which this parser
+                            // intentionally does not, see below) a trailing byte whose
+                            // value happens to be white-space cannot be distinguished
+                            // from a genuine terminating data byte. The extra byte is
+                            // harmless downstream — every filter and image decoder
+                            // consumes only the bytes it needs — so retaining it is the
+                            // safe choice; trimming risks dropping a real data byte.
                             let image_data = &stream_data[..end_offset];
 
                             let stream = Stream::new(image_data, dict.clone());
@@ -421,11 +435,17 @@ impl<'a> TypedIter<'a> {
 }
 
 /// An instruction (= operator and its operands) in a content stream.
+///
+/// All fields are private; the public surface is the accessor methods
+/// ([`operands`](Self::operands), [`operator`](Self::operator),
+/// [`source`](Self::source), [`offset`](Self::offset)). This keeps the
+/// borrow shapes (`&Stack` vs. an operand iterator) and the buffer-offset
+/// contract encapsulated rather than leaking the raw fields.
 pub struct Instruction<'b, 'a> {
     /// The stack containing the operands.
-    pub operands: &'b Stack<'a>,
+    operands: &'b Stack<'a>,
     /// The actual operator.
-    pub operator: &'b Operator<'a>,
+    operator: &'b Operator<'a>,
     /// Raw source bytes of this instruction inside the buffer passed to
     /// [`UntypedIter::new`]. See [`Instruction::source`].
     source: &'a [u8],
@@ -438,6 +458,11 @@ impl<'b, 'a> Instruction<'b, 'a> {
     /// An iterator over the operands of the instruction.
     pub fn operands(&self) -> OperandIterator<'b, 'a> {
         OperandIterator::new(self.operands)
+    }
+
+    /// The operator of this instruction.
+    pub fn operator(&self) -> &'b Operator<'a> {
+        self.operator
     }
 
     /// Return the raw source bytes of this instruction, including
@@ -860,17 +885,16 @@ mod tests {
         assert_eq!(dict.get::<i64>(b"BPC"), Some(8));
 
         let body = inline.0.raw_data();
-        // The inline-image parser includes a single trailing whitespace
-        // separator before `EI`; accept either representation.
-        let body_bytes = body.as_ref();
-        assert!(
-            body_bytes.starts_with(b"\x00\xff\x00\xff"),
-            "body starts with image bytes, got {body_bytes:?}"
-        );
-        assert!(
-            body_bytes.len() == 4 || (body_bytes.len() == 5 && body_bytes[4].is_ascii_whitespace()),
-            "body has expected length, got {body_bytes:?}"
-        );
+        // L6: the body retains the OPTIONAL white-space that delimits
+        // the image data from `EI`. ISO 32000-2 §8.9.7 mandates a single
+        // white-space only AFTER `ID`; the pre-`EI` delimiter is optional
+        // (§8.9.7 NOTE 2) and /Length excludes it. It is deliberately NOT
+        // trimmed — the raw bytes are opaque, so a trailing
+        // white-space-valued byte cannot be distinguished from a genuine
+        // data byte without consulting /Length (which this parser does
+        // not). So the body is exactly the four image bytes followed by
+        // that one separator.
+        assert_eq!(body.as_ref(), b"\x00\xff\x00\xff ");
     }
 
     // --- DeviceN beyond the inline operand cap ---------------------------

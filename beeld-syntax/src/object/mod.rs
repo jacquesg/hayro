@@ -389,11 +389,35 @@ mod tests {
         // word so `Name::byte_range` can report the absolute span of
         // the token body in the parent buffer (Phase A of Wave
         // R-UTF8-NameToken-Substrate). The niche packing keeps the
-        // payload at 4 bytes; alignment then pushes the variant from
-        // 48 → 56 bytes (and `Object<'_>` from 56 → 64). The
-        // assertions are budget guards, not invariants — bumping them
-        // is the deliberate trade-off for enabling byte-identical
-        // multi-site name rewrites during remediation.
+        // payload at 4 bytes; alignment then pushes the `Name` variant
+        // from 48 → 56 bytes. `Object<'_>` is 64 either way: it is its
+        // co-largest payload (56 — `String<'_>` ties `Name<'_>`) plus a
+        // full 8-byte discriminant word, and `String<'_>` — which carries
+        // no offset — already pins that payload at 56 on its own (source
+        // spans + kind; see `String`'s `object_size_regression` test). The
+        // assertions are budget guards, not invariants — bumping them is
+        // the deliberate trade-off for enabling byte-identical multi-site
+        // name rewrites during remediation.
+        //
+        // Two distinct things are stored, with different justifications:
+        //
+        //   * The source VALUE bytes are genuinely unconditional. `Name`'s
+        //     `source` IS the decoded value for the common `Borrowed`
+        //     variant — `Name::as_ref` returns it, read on every name
+        //     comparison and dict-key lookup — and `String`'s `source` feeds
+        //     the non-inspect decryption path (`String::read` builds the
+        //     `Decrypted` variant from it). This is inherent value storage
+        //     and cannot be gated.
+        //
+        //   * The `offset` word — the field that drives the `Name` 48 → 56
+        //     growth above — is read by `Name::byte_range`, which backs
+        //     byte-identical multi-site name rewriting: a CORE capability
+        //     (see above), not inspection-only tooling, so it is
+        //     unconditional. Gating it behind `inspect` would not even shrink
+        //     `Object` — `size_of::<Object>()` stays 64, bounded by the
+        //     co-largest 56-byte `String<'_>` payload (which carries no
+        //     offset) — and would reclaim 8 bytes only per standalone `Name`
+        //     (56 → 48), at the cost of the always-available rewrite API.
         assert_eq!(size_of::<Object<'_>>(), 64);
         assert_eq!(size_of::<Array<'_>>(), 32);
         assert_eq!(size_of::<Dict<'_>>(), 8);
@@ -402,5 +426,17 @@ mod tests {
         assert_eq!(size_of::<Number>(), 16);
         assert_eq!(size_of::<Stream<'_>>(), 24);
         assert_eq!(size_of::<String<'_>>(), 56);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn string_pins_object_size_independently_of_name_offset() {
+        // Pins the corrected rationale in `object_sizes`: `Object<'_>` is
+        // its co-largest payload plus a full 8-byte discriminant word, and
+        // `String<'_>` — which carries no source-offset — is that co-largest
+        // payload. Hence gating `Name`'s offset would NOT shrink `Object`
+        // (the reclaim is per-`Name`, not per-`Object`); this relation holds
+        // even if `Name` were later gated 56 → 48.
+        assert_eq!(size_of::<Object<'_>>(), size_of::<String<'_>>() + 8);
     }
 }

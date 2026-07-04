@@ -31,6 +31,13 @@ use core::ops::Deref;
 /// magnitude above the 32 MiB per-indirect-object scan bound used
 /// elsewhere in the toolkit, so legitimate large embedded streams pass
 /// while `1 KiB -> GiB` bombs are rejected. V1-FUZZ-001.
+///
+/// This is an intentionally fixed, compile-time cap: the filter layer
+/// takes no options struct, so there is no already-plumbed configuration
+/// point through which a caller could raise or lower it. Weakening the
+/// bound is a `DoS` regression, so it is deliberately not exposed for
+/// tuning; raising it would require threading a limit through
+/// [`Filter::apply`] and every decoder, which is out of scope here.
 pub(crate) const MAX_DECOMPRESSED_BYTES: usize = 128 * 1024 * 1024;
 
 /// Maximum number of chained filters on a single stream

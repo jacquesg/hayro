@@ -100,8 +100,12 @@ impl Number {
 ///
 /// Distinguishes between integer literals (e.g. `42`) and real literals
 /// (e.g. `42.0`) as written in the source PDF. See [`Number::kind`].
+///
+/// ISO 32000-1 §7.3.3 defines exactly two numeric object forms (integer
+/// and real), so this enum has a fixed cardinality and is deliberately
+/// NOT `#[non_exhaustive]`: it can never gain a variant, and downstream
+/// code may match it exhaustively.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[non_exhaustive]
 pub enum NumberKind {
     /// An integer literal — written without a decimal point.
     Integer,

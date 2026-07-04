@@ -218,10 +218,23 @@ fn read_inner<'a>(
         },
     )?;
 
+    // Values are re-read lazily by `get_raw`, each from a fresh sub-reader
+    // over `&data[offset..]` whose byte offsets do not map to file
+    // positions. Mark the stored context detached so `Name::byte_range`
+    // reports `None` for value names; the keys parsed above against `ctx`
+    // keep their (file-absolute, when `ctx` is not itself detached)
+    // offsets. If `ctx` is already detached the clone inherits the flag, so
+    // skip the redundant `set_detached`, whose `Arc::make_mut` would
+    // deep-clone the shared context to no effect.
+    let mut value_ctx = ctx.clone();
+    if !ctx.detached() {
+        value_ctx.set_detached(true);
+    }
+
     Some(Dict(Inner::Some(Arc::new(Repr {
         data,
         offsets,
-        ctx: ctx.clone(),
+        ctx: value_ctx,
     }))))
 }
 
@@ -295,7 +308,11 @@ where
 
             break Some(&dict_data[..end_offset]);
         } else {
-            let Some(name) = r.read_without_context::<Name<'_>>() else {
+            // Read the key WITH the context (not context-free) so the key
+            // name inherits the detached/object-stream flags of the buffer
+            // it is being lexed from; this governs whether its
+            // `Name::byte_range` is a valid file position.
+            let Some(name) = r.read_with_context::<Name<'_>>(ctx) else {
                 if start_tag.is_some() {
                     // In case there is garbage in-between, be lenient and just try to skip it.
                     // But only do this if we are parsing a proper dictionary as opposed to an

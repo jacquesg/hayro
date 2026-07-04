@@ -103,9 +103,20 @@ impl<'a> Readable<'a> for Array<'a> {
     fn read(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
         let bytes = r.skip::<Array<'_>>(ctx.in_content_stream())?;
 
+        // Elements are read lazily from a fresh sub-reader over `data`,
+        // whose byte offsets do not map to file positions; mark the stored
+        // context detached so element names report `None` from
+        // `Name::byte_range`. If the context is already detached the clone
+        // inherits the flag, so skip the redundant `set_detached`, whose
+        // `Arc::make_mut` would deep-clone the shared context to no effect.
+        let mut ctx = ctx.clone();
+        if !ctx.detached() {
+            ctx.set_detached(true);
+        }
+
         Some(Self {
             data: &bytes[1..bytes.len() - 1],
-            ctx: ctx.clone(),
+            ctx,
         })
     }
 }

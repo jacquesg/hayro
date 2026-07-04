@@ -724,7 +724,14 @@ impl XRef {
             Inner::Some(r) => {
                 let bytes = r.trailer_dict_bytes.as_deref()?;
                 let mut reader = Reader::new(bytes);
-                reader.read_with_context::<Dict<'_>>(&ReaderContext::new(self, false))
+                // `trailer_dict_bytes` is a standalone copy of the dict's
+                // `<<...>>` bytes (byte 0 is the `<<`), not the file buffer.
+                // Detach so key names report `byte_range() == None` rather
+                // than an offset into this private copy misread as a file
+                // position.
+                let mut ctx = ReaderContext::new(self, false);
+                ctx.set_detached(true);
+                reader.read_with_context::<Dict<'_>>(&ctx)
             }
         }
     }
@@ -907,6 +914,10 @@ impl XRef {
                 EntryType::Free { .. } => None,
                 EntryType::Normal { offset } => {
                     ctx.set_in_object_stream(false);
+                    // The object is lexed from a streamed-object window, not
+                    // the resident file buffer, so its byte offsets do not
+                    // map to file positions.
+                    ctx.set_detached(true);
                     let end_bound = repr.next_object_bound(offset);
                     if let Some(window) = repr.data.object_window(offset as u64, end_bound) {
                         let mut r = Reader::new(window);
@@ -953,6 +964,11 @@ impl XRef {
             EntryType::Free { .. } => None,
             EntryType::Normal { offset } => {
                 ctx.set_in_object_stream(false);
+                // Lexed from the resident whole-file buffer at its true
+                // offset (`r.jump` below), so offsets ARE file positions:
+                // clear any `detached` flag a referring dict's value context
+                // set, mirroring the streamed branch's `set_detached(true)`.
+                ctx.set_detached(false);
                 r.jump(offset);
 
                 if let Some(object) = r.read_with_context::<IndirectObject<T>>(&ctx) {
@@ -1849,6 +1865,9 @@ impl<'a> ObjectStream<'a> {
 
         let mut ctx = ctx.clone();
         ctx.set_in_object_stream(true);
+        // Objects here are lexed from the decoded object-stream buffer, so
+        // their byte offsets do not map to file positions.
+        ctx.set_detached(true);
 
         Some(Self { data, ctx, offsets })
     }
@@ -2170,6 +2189,37 @@ mod tests {
         let k1: Vec<Vec<u8>> = first.keys().map(|k| k.as_ref().to_vec()).collect();
         let k2: Vec<Vec<u8>> = second.keys().map(|k| k.as_ref().to_vec()).collect();
         assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn trailer_keys_report_no_byte_range() {
+        // The trailer is re-parsed from `trailer_dict_bytes`, a standalone
+        // copy of the dict's `<<...>>` bytes rather than the file buffer, so
+        // its key names must report `byte_range() == None`. A `Some` here
+        // would be an offset into that private copy, misread as a file
+        // position, violating `Name::byte_range`'s contract.
+        let bytes = build_pdf(
+            &[
+                "<< /Type /Catalog /Pages 2 0 R >>",
+                "<< /Type /Pages /Kids [] /Count 0 >>",
+            ],
+            "/Root 1 0 R /ID [<aa> <bb>]",
+        );
+        let pdf = Pdf::new(bytes).expect("pdf loads");
+        let trailer = pdf.trailer().expect("trailer available");
+        let mut key_count = 0;
+        for key in trailer.keys() {
+            assert!(
+                key.byte_range().is_none(),
+                "trailer key {:?} leaked a byte_range from the private copy",
+                key.as_ref(),
+            );
+            key_count += 1;
+        }
+        assert!(
+            key_count >= 3,
+            "expected Size/Root/ID keys, got {key_count}"
+        );
     }
 
     #[test]

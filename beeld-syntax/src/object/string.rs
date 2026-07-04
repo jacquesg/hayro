@@ -7,7 +7,6 @@ use crate::object::macros::object;
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 use crate::trivia::is_white_space_character;
-use alloc::borrow::Cow;
 use core::borrow::Borrow;
 use core::hash::{Hash, Hasher};
 use core::ops::Deref;
@@ -15,12 +14,16 @@ use smallvec::SmallVec;
 
 /// Lexical form of a PDF [`String`] as it appeared in source.
 ///
-/// ISO 32000-1 §7.3.4 defines two string forms. A consumer that cares
-/// about source-level constraints — diagnostics, byte-length limits
-/// before decoding, or round-trip rewriting — uses this to discriminate
-/// between them.
+/// Distinguishes the literal `(…)` and hexadecimal `<…>` forms as they
+/// appear in source. A consumer that cares about source-level
+/// constraints — diagnostics, byte-length limits before decoding, or
+/// round-trip rewriting — uses this to discriminate between them.
+///
+/// ISO 32000-1 §7.3.4 defines exactly two string forms (literal and
+/// hexadecimal), so this enum has a fixed cardinality and is deliberately
+/// NOT `#[non_exhaustive]`: it can never gain a variant, and downstream
+/// code may match it exhaustively.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[non_exhaustive]
 pub enum StringKind {
     /// `(…)` literal string.
     Literal,
@@ -30,24 +33,32 @@ pub enum StringKind {
 
 #[derive(Clone)]
 enum StringInner<'a> {
-    /// A literal `(…)` string. `source` is the bytes between the
-    /// parentheses; `decoded` is the escape-expanded value, `Cow::Borrowed`
-    /// when the source needs no escape processing.
-    Literal {
+    /// A literal `(…)` string whose source needs no escape processing:
+    /// the decoded value is byte-identical to `source` and borrowed
+    /// zero-copy.
+    LiteralBorrowed { source: &'a [u8] },
+    /// A literal `(…)` string containing escape sequences. `source` is
+    /// the raw pre-decode bytes; `decoded` is the escape-expanded value,
+    /// held in a `SmallVec` so short strings stay inline (no heap
+    /// allocation).
+    LiteralOwned {
         source: &'a [u8],
-        decoded: Cow<'a, [u8]>,
+        decoded: SmallVec<[u8; 23]>,
     },
     /// A hex `<…>` string. `source` is the bytes between the angle
-    /// brackets (whitespace preserved); `decoded` is the decoded bytes.
+    /// brackets (whitespace preserved) — i.e. the ASCII hex encoding;
+    /// `decoded` is the decoded bytes, kept inline for short strings.
     Hex {
         source: &'a [u8],
-        decoded: Cow<'a, [u8]>,
+        decoded: SmallVec<[u8; 23]>,
     },
     /// Produced by decryption of a literal or hex ciphertext. `source`
-    /// is the CIPHERTEXT bytes as they appeared in the PDF (between
-    /// the `(…)` or `<…>` delimiters, pre-decryption). `kind` is the
-    /// lexical form of that ciphertext container. `decoded` is the
-    /// post-decryption plaintext.
+    /// is the raw bytes between the `(…)` or `<…>` delimiters exactly as
+    /// they appeared in the PDF, BEFORE decryption. For a hex container
+    /// this is therefore the ASCII hex ENCODING of the ciphertext, not
+    /// the raw ciphertext bytes themselves; for a literal container it is
+    /// the escape-uninterpreted bytes. `kind` is the lexical form of that
+    /// container. `decoded` is the post-decryption plaintext.
     Decrypted {
         source: &'a [u8],
         kind: StringKind,
@@ -58,14 +69,17 @@ enum StringInner<'a> {
 impl<'a> StringInner<'a> {
     fn decoded(&self) -> &[u8] {
         match self {
-            Self::Literal { decoded, .. } | Self::Hex { decoded, .. } => decoded,
-            Self::Decrypted { decoded, .. } => decoded,
+            Self::LiteralBorrowed { source } => source,
+            Self::LiteralOwned { decoded, .. }
+            | Self::Hex { decoded, .. }
+            | Self::Decrypted { decoded, .. } => decoded,
         }
     }
 
     fn source(&self) -> &'a [u8] {
         match *self {
-            Self::Literal { source, .. }
+            Self::LiteralBorrowed { source }
+            | Self::LiteralOwned { source, .. }
             | Self::Hex { source, .. }
             | Self::Decrypted { source, .. } => source,
         }
@@ -73,7 +87,7 @@ impl<'a> StringInner<'a> {
 
     fn kind(&self) -> StringKind {
         match self {
-            Self::Literal { .. } => StringKind::Literal,
+            Self::LiteralBorrowed { .. } | Self::LiteralOwned { .. } => StringKind::Literal,
             Self::Hex { .. } => StringKind::Hex,
             Self::Decrypted { kind, .. } => *kind,
         }
@@ -104,11 +118,14 @@ impl<'a> String<'a> {
     ///
     /// For a literal string `(Hello\n)` this returns `b"Hello\\n"`
     /// — the backslash-escape is left uninterpreted. For a hex string
-    /// `<48656C 6C6F>` this returns `b"48656C 6C6F"` — whitespace is
-    /// preserved. For a decrypted string this returns the CIPHERTEXT
-    /// bytes as they appeared in the PDF source, NOT the decrypted
-    /// plaintext; call [`as_bytes`](Self::as_bytes) for the decoded
-    /// value.
+    /// `<48656C 6C6F>` this returns `b"48656C 6C6F"` — the ASCII hex
+    /// encoding, whitespace preserved. For a decrypted string this
+    /// returns the raw bytes exactly as they appeared between the
+    /// delimiters in the PDF source, BEFORE decryption — for a hex
+    /// container that is the ASCII hex encoding of the ciphertext (not
+    /// the raw ciphertext bytes), and for a literal container the
+    /// escape-uninterpreted bytes. Call [`as_bytes`](Self::as_bytes)
+    /// for the decrypted plaintext.
     pub fn source(&self) -> &'a [u8] {
         self.0.source()
     }
@@ -223,12 +240,12 @@ fn read_hex<'a>(r: &mut Reader<'a>) -> Option<StringInner<'a>> {
 
     // Exclude outer brackets.
     let source = r.range(start + 1..end - 1)?;
+    // Keep the decoded bytes in a `SmallVec` so short hex strings stay
+    // inline; `into_vec()` would force a heap allocation even for a
+    // handful of bytes.
     let decoded: SmallVec<[u8; 23]> = ascii_hex::decode_into(source)?;
 
-    Some(StringInner::Hex {
-        source,
-        decoded: Cow::Owned(decoded.into_vec()),
-    })
+    Some(StringInner::Hex { source, decoded })
 }
 
 fn skip_literal(r: &mut Reader<'_>) -> Option<()> {
@@ -260,10 +277,7 @@ fn read_literal<'a>(r: &mut Reader<'a>) -> Option<StringInner<'a>> {
     let source = r.range(start + 1..end - 1)?;
 
     if !source.iter().any(|b| matches!(b, b'\\' | b'\n' | b'\r')) {
-        return Some(StringInner::Literal {
-            source,
-            decoded: Cow::Borrowed(source),
-        });
+        return Some(StringInner::LiteralBorrowed { source });
     }
 
     let mut r = Reader::new(source);
@@ -343,9 +357,12 @@ fn read_literal<'a>(r: &mut Reader<'a>) -> Option<StringInner<'a>> {
         }
     }
 
-    Some(StringInner::Literal {
+    // Keep the escape-expanded bytes in a `SmallVec` so short literal
+    // strings stay inline; `into_vec()` would force a heap allocation
+    // even for a handful of bytes.
+    Some(StringInner::LiteralOwned {
         source,
-        decoded: Cow::Owned(result.into_vec()),
+        decoded: result,
     })
 }
 
@@ -635,8 +652,49 @@ mod tests {
     #[test]
     fn object_size_regression() {
         // Retaining source spans + lexical kind widens String<'_>. Lock the
-        // new size so surprise growth is caught.
+        // new size so surprise growth is caught. The L3 SmallVec swap (Cow
+        // -> inline SmallVec for the owned hex/escaped decoded bytes) must
+        // not grow this past the 56-byte budget.
         #[cfg(target_pointer_width = "64")]
         assert_eq!(size_of::<String<'_>>(), 56);
+    }
+
+    // --- L3: short hex/escaped strings stay inline (no heap alloc). The
+    // inline capacity is 23 bytes; decoding must be byte-for-byte identical
+    // whether the value stays inline or spills to the heap. ---
+
+    #[test]
+    fn hex_decode_identical_inline_and_spilled() {
+        use alloc::vec::Vec;
+        // 13 decoded bytes -> inline.
+        let inline = parse(b"<00112233445566778899AABBCC>");
+        assert_eq!(
+            inline.as_bytes(),
+            &[
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC
+            ]
+        );
+        assert_eq!(inline.kind(), StringKind::Hex);
+        // 30 decoded bytes (> 23) -> heap spill; must decode identically.
+        let spilled = parse(b"<000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D>");
+        let expected: Vec<u8> = (0_u8..30).collect();
+        assert_eq!(spilled.as_bytes(), expected.as_slice());
+        assert_eq!(spilled.kind(), StringKind::Hex);
+    }
+
+    #[test]
+    fn escaped_literal_decode_identical_inline_and_spilled() {
+        // Short escaped literal stays inline.
+        let inline = parse(b"(a\\nb)");
+        assert_eq!(inline.as_bytes(), b"a\nb");
+        assert_eq!(inline.kind(), StringKind::Literal);
+        // Longer escaped literal (> 23 decoded bytes) spills to the heap;
+        // the escape handling and byte values must be unchanged.
+        let spilled = parse(b"(abcdefghijklmnopqrstuvwxyz0123456789\\n)");
+        assert_eq!(
+            spilled.as_bytes(),
+            b"abcdefghijklmnopqrstuvwxyz0123456789\n"
+        );
+        assert_eq!(spilled.kind(), StringKind::Literal);
     }
 }
