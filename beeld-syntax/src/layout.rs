@@ -9,7 +9,8 @@
 //!
 //! Gated on the `inspect` feature, per §1.4 of the fork roadmap.
 
-use crate::object::ObjectIdentifier;
+use crate::object::{Object, ObjectIdentifier};
+use crate::reader::{Reader, ReaderContext, ReaderExt};
 use alloc::vec::Vec;
 use core::ops::Range;
 
@@ -185,16 +186,35 @@ pub enum LayoutKind {
 /// Scan the indirect-object span starting at `offset` in `data`.
 ///
 /// Returns `None` if the header does not parse as `N<whitespace>G<whitespace>obj`
-/// or if `endobj` is not found. Header-canonicity and EOL flags are
+/// or if no `endobj` can be found. Header-canonicity and EOL flags are
 /// populated per [`IndirectLayout`].
+///
+/// The object's value is parsed structurally by the canonical object
+/// reader, so the `endobj` search resumes past the whole value rather
+/// than stopping at a false `endobj` byte sequence occurring inside a
+/// string, name, or stream body (ISO 32000-1 §7.3.4, §7.3.5, §7.3.8.2).
+/// For a stream the skipped body is bounded by the stream's `/Length`,
+/// and stream-ness is decided by the reader — a `stream` keyword
+/// following the object's top-level dictionary — not by an incidental
+/// `stream` token elsewhere in the body. When `/Length` is absent,
+/// indirect, or wrong, the reader's recovery path bounds the body at the
+/// first `endstream` sequence, so a crafted body can still spoof the
+/// terminator — the residual §7.3.8 limitation documented on
+/// `Stream::keyword_body_range`.
 pub(crate) fn scan_indirect_layout(data: &[u8], offset: usize) -> Option<IndirectLayout> {
     let tail = data.get(offset..)?;
 
     let (header_canonical, header_end) = parse_indirect_header(tail)?;
+    let body_start = offset + header_end;
 
-    // Find `endobj` in the body after the header.
-    let endobj_rel = find_subslice(&tail[header_end..], b"endobj")? + header_end;
-    let endobj_pos = offset + endobj_rel;
+    // Locate the `endobj` that closes this object. The value may contain
+    // the literal bytes `endobj` — inside a string, a name, or a stream's
+    // `/Length`-bounded binary body — so parse it structurally and resume
+    // the search past the whole parsed value rather than inside it. A value
+    // that does not parse (or a bare keyword / empty body) is searched from
+    // the body start.
+    let search_from = value_end(data, body_start).unwrap_or(body_start);
+    let endobj_pos = search_from + find_subslice(data.get(search_from..)?, b"endobj")?;
     let endobj_end = endobj_pos + b"endobj".len();
 
     // The byte immediately before `endobj` — relative to the full data
@@ -213,6 +233,39 @@ pub(crate) fn scan_indirect_layout(data: &[u8], offset: usize) -> Option<Indirec
         endobj_preceded_by_eol,
         endobj_followed_by_eol,
     })
+}
+
+/// Return the byte offset just past the object value beginning at
+/// `value_start` in `data`, so the `endobj` search can resume beyond it.
+///
+/// The value is parsed by the canonical object reader, which consumes the
+/// whole value — dict, stream, array, string, or name — so the returned
+/// offset lies past any `endobj` bytes embedded in a string, name, or
+/// (`/Length`-bounded) stream body (ISO 32000-1 §7.3.4, §7.3.5, §7.3.6,
+/// §7.3.8.2). Stream-ness is decided by the reader — a `stream` keyword
+/// following the object's top-level dictionary (ISO 32000-1 §7.3.8) — not
+/// by an incidental `stream` token inside a name or string.
+///
+/// Returns `None` — so the caller searches from the body start — for a
+/// value that does not parse, and for a `null` value. The `Null` arm also
+/// covers the reader's lenient operator-like fallback: for a body that is
+/// not a real value (e.g. `endobj` directly, an empty object) it yields
+/// `Null` after consuming a bare keyword whose end may lie *past* the real
+/// terminator, so that offset must not be trusted. A `null` value embeds no
+/// `endobj` bytes, so resuming from the body start is equally correct
+/// for it.
+fn value_end(data: &[u8], value_start: usize) -> Option<usize> {
+    let mut reader = Reader::new(data);
+    reader.jump(value_start);
+    // Mirror `IndirectObject::read`: the value may be preceded by
+    // whitespace or a comment (e.g. `obj <<`, `obj\n\n<<`, `obj\n%c\n<<`),
+    // which `Object::read` does not skip. Without this the value reads as
+    // `Null` and a genuine stream/dict is missed.
+    reader.skip_white_spaces_and_comments();
+    match reader.read_with_context::<Object<'_>>(&ReaderContext::dummy())? {
+        Object::Null(_) => None,
+        _ => Some(reader.offset()),
+    }
 }
 
 /// Parse an `N G obj` header.
@@ -466,5 +519,158 @@ mod tests {
         // endobj ends just before `\nmore` → offset of `\n` is 7 + 7 + "(hi)\n".len() + "endobj".len()
         // Actual: 7 + 13 (header) + 5 ("(hi)\n") + 6 ("endobj") — tricky, just assert bounds.
         assert!(data[layout.range.clone()].ends_with(b"endobj"));
+    }
+
+    #[test]
+    fn endobj_inside_stream_body_is_skipped() {
+        // The stream body contains the literal bytes `endobj`. The scanner
+        // must skip the body (stream .. endstream) and take the real
+        // `endobj` after `endstream`, not the false one inside the body.
+        let data = b"5 0 obj\n<< /Length 8 >>\nstream\nXendobjX\nendstream\nendobj\n";
+        let layout = scan_indirect_layout(data, 0).expect("layout");
+        // The real `endobj` ends just before the final trailing `\n`.
+        assert_eq!(layout.range.end, data.len() - 1);
+        assert!(data[layout.range.clone()].ends_with(b"endobj"));
+        // The span must cover the whole stream (proving the in-body `endobj`
+        // was not taken as the boundary).
+        assert!(find_subslice(&data[layout.range.clone()], b"endstream").is_some());
+    }
+
+    #[test]
+    fn non_stream_object_layout_unaffected() {
+        // A non-stream object whose file is followed by a later stream
+        // object: the trailing `stream` keyword must not be treated as this
+        // object's body.
+        let data = b"5 0 obj\n<< /A 1 >>\nendobj\n6 0 obj\n<< /Length 1 >>\nstream\nx\nendstream\nendobj\n";
+        let layout = scan_indirect_layout(data, 0).expect("layout");
+        assert!(data[layout.range.clone()].ends_with(b"endobj"));
+        // Bounded to object 5: the range must end before object 6's header.
+        let obj6 = find_subslice(data, b"6 0 obj").expect("obj 6");
+        assert!(layout.range.end <= obj6);
+    }
+
+    #[test]
+    fn stream_body_endstream_endobj_bytes_bounded_by_length() {
+        // A stream whose body — bounded by a correct `/Length` — itself
+        // contains the byte sequences `endstream` then `endobj`. The scan
+        // must skip the whole `/Length`-sized body (not stop at the first
+        // in-body `endstream`/`endobj`) and take the real terminator, per
+        // ISO 32000-1 §7.3.8.2. Regression pin for the `/Length`-ignoring
+        // first-`endstream` text search.
+        let data = b"5 0 obj\n<< /Length 21 >>\nstream\nAAendstreamBBendobjCC\nendstream\nendobj\n";
+        let layout = scan_indirect_layout(data, 0).expect("layout");
+        // Ends at the real `endobj`, just before the final trailing `\n`.
+        assert_eq!(layout.range.end, data.len() - 1);
+        assert!(data[layout.range.clone()].ends_with(b"endobj"));
+        // The span covers the real `endstream`, proving neither the in-body
+        // `endstream` nor the in-body `endobj` was taken as the boundary.
+        let real_endstream = find_subslice(data, b"\nendstream\n").expect("real endstream");
+        assert!(layout.range.end > real_endstream);
+    }
+
+    #[test]
+    fn endobj_in_dict_string_before_stream_is_not_the_boundary() {
+        // A genuine stream whose dictionary carries the bytes `endobj`
+        // inside a string, before the `stream` keyword. The scan must not
+        // mistake that in-dictionary `endobj` for the object boundary; the
+        // body is `/Length`-bounded and the real `endobj` follows
+        // `endstream`.
+        let data = b"5 0 obj\n<< /X (endobj) /Length 3 >>\nstream\nabc\nendstream\nendobj\n";
+        let layout = scan_indirect_layout(data, 0).expect("layout");
+        assert_eq!(layout.range.end, data.len() - 1);
+        assert!(data[layout.range.clone()].ends_with(b"endobj"));
+        assert!(find_subslice(&data[layout.range.clone()], b"endstream").is_some());
+    }
+
+    #[test]
+    fn non_stream_string_containing_stream_token_is_not_a_stream() {
+        // A non-stream object whose string value ends a line with the token
+        // `stream`. `value_end` classifies via the canonical object reader,
+        // so the value reads as a `String` — not a `Stream` — and the
+        // `endobj` search resumes just past the string, reaching the real
+        // `endobj`.
+        let data = b"1 0 obj\n(a stream\nx)\nendobj\n";
+        let layout = scan_indirect_layout(data, 0).expect("layout");
+        assert_eq!(layout.range.end, data.len() - 1);
+        assert!(data[layout.range.clone()].ends_with(b"endobj"));
+
+        // A second form: the `stream` token sits mid-string.
+        let data = b"5 0 obj\n(see stream\nmore)\nendobj\n";
+        let layout = scan_indirect_layout(data, 0).expect("layout");
+        assert_eq!(layout.range.end, data.len() - 1);
+        assert!(data[layout.range.clone()].ends_with(b"endobj"));
+    }
+
+    #[test]
+    fn endobj_in_nonstream_dict_string_is_not_the_boundary() {
+        // A plain (non-stream) dictionary object carrying the bytes `endobj`
+        // inside a string value. The value is parsed structurally, so the
+        // search resumes past `>>` and takes the real terminator — not the
+        // false `endobj` inside the string (ISO 32000-1 §7.3.4).
+        let data = b"1 0 obj\n<< /X (endobj) >>\nendobj\n";
+        let layout = scan_indirect_layout(data, 0).expect("layout");
+        assert_eq!(layout.range.end, data.len() - 1);
+        assert!(data[layout.range.clone()].ends_with(b"endobj"));
+    }
+
+    #[test]
+    fn endobj_in_nonstream_name_value_is_not_the_boundary() {
+        // A name value whose characters spell `endobj`. Parsed structurally,
+        // the search resumes past the name rather than stopping at the
+        // in-name `endobj` (ISO 32000-1 §7.3.5).
+        let data = b"1 0 obj\n/endobj\nendobj\n";
+        let layout = scan_indirect_layout(data, 0).expect("layout");
+        assert_eq!(layout.range.end, data.len() - 1);
+        assert!(data[layout.range.clone()].ends_with(b"endobj"));
+    }
+
+    #[test]
+    fn endobj_in_nonstream_array_string_is_not_the_boundary() {
+        // An array value carrying the bytes `endobj` inside a nested string.
+        // The whole array is consumed, so the false in-array `endobj` is not
+        // taken as the boundary (ISO 32000-1 §7.3.6).
+        let data = b"1 0 obj\n[ (endobj) ]\nendobj\n";
+        let layout = scan_indirect_layout(data, 0).expect("layout");
+        assert_eq!(layout.range.end, data.len() - 1);
+        assert!(data[layout.range.clone()].ends_with(b"endobj"));
+    }
+
+    #[test]
+    fn object_with_no_value_body_resolves_to_endobj() {
+        // No value between `obj` and `endobj`. The object reader's lenient
+        // operator-like fallback consumes the `endobj` keyword itself and
+        // yields `Null`; the scanner must not trust that offset (it lies past
+        // the real terminator) and must instead resolve to the real `endobj`.
+        let data = b"1 0 obj\nendobj\n";
+        let layout = scan_indirect_layout(data, 0).expect("layout");
+        assert_eq!(layout.range.end, data.len() - 1);
+        assert!(data[layout.range.clone()].ends_with(b"endobj"));
+    }
+
+    #[test]
+    fn stream_with_false_endobj_body_detected_despite_noncanonical_obj_spacing() {
+        // A genuine stream whose `/Length`-bounded body carries the literal
+        // bytes `endobj`. When the `N G obj` header is not the common
+        // `obj\n<<` form — a space after `obj`, more than one EOL, or an
+        // interposed comment line — the dictionary still opens the body, so
+        // `value_end` must skip that leading whitespace/comment (as
+        // the canonical `IndirectObject::read` does) before classifying the
+        // value. Without the skip the value reads as `Null`, the stream is
+        // missed, and the `endobj` search falls back to `body_start` and
+        // stops at the false in-body `endobj`, truncating the range.
+        let variants: [&[u8]; 3] = [
+            b"5 0 obj << /Length 8 >>\nstream\nXendobjX\nendstream\nendobj\n",
+            b"5 0 obj\n\n<< /Length 8 >>\nstream\nXendobjX\nendstream\nendobj\n",
+            b"5 0 obj\n%c\n<< /Length 8 >>\nstream\nXendobjX\nendstream\nendobj\n",
+        ];
+        for data in variants {
+            let layout = scan_indirect_layout(data, 0).expect("layout");
+            // Reaches the real terminating `endobj`, just before the final EOL.
+            assert_eq!(layout.range.end, data.len() - 1);
+            assert!(data[layout.range.clone()].ends_with(b"endobj"));
+            // The span covers the real `endstream`, proving the in-body
+            // `endobj` was not taken as the boundary.
+            assert!(find_subslice(&data[layout.range.clone()], b"endstream").is_some());
+        }
     }
 }

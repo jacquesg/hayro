@@ -216,34 +216,39 @@ impl<'a> Stream<'a> {
         }
     }
 
-    /// Return the byte range of the raw content between the `stream`
-    /// and `endstream` keywords, independent of the dict's `/Length`.
+    /// Return the byte range from just after the `stream` keyword's EOL
+    /// up to (but not including) the `e` of the terminating `endstream`.
     ///
-    /// Useful for validators detecting `/Length` mismatches: the range
-    /// covers every byte from the position just after the `stream`
-    /// keyword's trailing EOL up to (but not including) the `e` of
-    /// `endstream`, regardless of what the stream dictionary declares
-    /// for `/Length`. Trailing whitespace inserted between the body
-    /// and `endstream` is included in the returned span.
+    /// Useful for validators detecting `/Length` mismatches: the span
+    /// covers the raw body plus any whitespace inserted between the body
+    /// and `endstream`. The terminating `endstream` is located by
+    /// scanning forward from the **end of the parsed body**, not its
+    /// start, so a false `endstream` sequence occurring within the body
+    /// bytes is not mistaken for the terminator. On the `/Length`-driven
+    /// proper parse the parsed body is exactly `/Length` bytes, so this
+    /// cross-checks the declared length; on the recovery parse the body
+    /// already runs to the first `endstream`, so for a `/Length`-less
+    /// stream a false `endstream` inside the body cannot be
+    /// distinguished (the residual limitation of ISO 32000-1 §7.3.8).
     ///
     /// Returns `None` when the stream was not physically located in
     /// the source bytes (for example, object-stream entries or
     /// synthetic streams) or when the `endstream` keyword cannot be
-    /// found by scanning forward from the body's starting offset.
+    /// found by scanning forward from the body's end offset.
     ///
     /// Requires the `inspect` feature.
     #[cfg(feature = "inspect")]
     pub fn keyword_body_range(&self) -> Option<core::ops::Range<usize>> {
         // body_range().start is anchored at the byte immediately
         // following the `stream` keyword's EOL terminator by both
-        // parse_proper and parse_fallback, so it does not depend on
-        // /Length. The end is what we compute independently by
-        // scanning for the `endstream` keyword.
+        // parse_proper and parse_fallback. Search for `endstream` from
+        // body.end (= body.start + the parsed body length) so an
+        // `endstream` byte sequence inside the body is skipped.
         let body = self.body_range()?;
         let pdf_data = self.dict.ctx().xref().data_bytes()?;
-        let tail = pdf_data.get(body.start..)?;
+        let tail = pdf_data.get(body.end..)?;
         let rel = find_needle(tail, b"endstream")?;
-        Some(body.start..body.start + rel)
+        Some(body.start..body.end + rel)
     }
 
     /// Return the physical layout of this stream's `stream`/`endstream`
@@ -732,6 +737,24 @@ mod tests {
             let kw = stream.keyword_body_range().expect("keyword body range");
             // 10 body bytes + trailing "\n" between body and endstream.
             assert_eq!(kw.len(), 11);
+        }
+
+        #[test]
+        fn keyword_body_range_skips_false_endstream_in_body() {
+            // A 13-byte body (declared /Length matches) that itself contains
+            // the literal bytes `endstream`. The terminator must be the real
+            // `endstream` after the body, not the one embedded in it.
+            let body: &[u8] = b"AAendstreamBB";
+            let bytes = build_pdf_with_declared_length(body, body.len(), b"\n", b"\n");
+            let pdf = Pdf::new(bytes).expect("pdf loads");
+            let stream = first_stream(&pdf).expect("stream");
+            let br = stream.body_range().expect("body range");
+            let kw = stream.keyword_body_range().expect("keyword body range");
+            assert_eq!(kw.start, br.start);
+            // 13 body bytes + the "\n" before the real endstream. A scan from
+            // body.start would stop at the in-body `endstream` (len 2).
+            assert_eq!(kw.len(), 14);
+            assert!(kw.end >= br.end);
         }
 
         #[test]

@@ -381,14 +381,17 @@ mod tests {
 
     #[cfg(feature = "inspect")]
     #[test]
-    fn first_page_trailer_none_for_non_linearized() {
+    fn first_page_trailer_some_for_non_linearized() {
         let pdf = Pdf::new(build_non_linearized()).expect("pdf loads");
-        // A non-linearized file has its only trailer before the single EOF.
-        // The method returns Some (the regular trailer) because the impl
-        // just finds the last `trailer` keyword before the first EOF — but
-        // non-linearized documents still have that. For conformance the
-        // distinction is provided by `is_linearized()`.
-        let _ = pdf.xref().first_page_trailer(); // exercise the path
+        assert!(!pdf.is_linearized());
+        // A non-linearized file has its only `trailer` before the single
+        // `%%EOF`. `first_page_trailer` returns the last `trailer` keyword
+        // before the first `%%EOF`, so here it yields the ordinary trailer;
+        // the linearized/non-linearized distinction is provided by
+        // `Pdf::is_linearized`, not by this method.
+        let trailer = pdf.xref().first_page_trailer().expect("ordinary trailer");
+        let size: i32 = trailer.get(b"Size").expect("Size");
+        assert_eq!(size, 3);
     }
 
     /// Build a minimal PDF that carries two xref sections chained via

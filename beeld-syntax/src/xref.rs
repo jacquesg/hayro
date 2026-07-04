@@ -449,13 +449,26 @@ impl XRef {
         }
     }
 
-    /// Resolve the cross-reference entry for the given object identifier.
+    // `EntryType`, `entry`, `entries`, and `size` are intentionally NOT
+    // behind `#[cfg(feature = "inspect")]`. `linearization::detect` — a
+    // non-inspect consumer reached from `Pdf::is_linearized` /
+    // `Pdf::linearization` — reads `entries()` and matches on `EntryType`
+    // to find the first indirect object, so gating them would break the
+    // default (non-inspect) build. They are part of the core surface.
+
+    /// Resolve the cross-reference entry in force for `id` in the
+    /// **effective** table.
     ///
-    /// Returns `None` for a dummy xref or when `id` is not present in any
-    /// xref section. The returned [`EntryType`] discriminates between
-    /// [`Normal`](EntryType::Normal) (offset in file), [`Compressed`](
-    /// EntryType::Compressed) (inside an object stream), and
-    /// [`Free`](EntryType::Free) (on the free list).
+    /// The effective table is the merge of every section along the
+    /// `/Prev` chain with newest-revision-wins precedence (ISO 32000-1
+    /// §7.5.6), so this returns the entry actually in force, not a
+    /// per-section view.
+    ///
+    /// Returns `None` for a dummy xref or when `id` is absent from every
+    /// section. The [`EntryType`] discriminates the in-use forms —
+    /// [`Normal`](EntryType::Normal) (byte offset) and
+    /// [`Compressed`](EntryType::Compressed) (inside an object stream) —
+    /// from [`Free`](EntryType::Free) (a free-list slot, §7.5.4).
     pub fn entry(&self, id: ObjectIdentifier) -> Option<EntryType> {
         match &self.0 {
             Inner::Dummy => None,
@@ -463,11 +476,19 @@ impl XRef {
         }
     }
 
-    /// Iterate over every entry in the cross-reference table, including
-    /// free entries.
+    /// Every entry of the **effective** cross-reference table, as
+    /// `(id, entry)` pairs.
     ///
-    /// Ordering is deterministic but unspecified — do not rely on
-    /// iteration order matching file order.
+    /// This is the union of the in-use entries
+    /// ([`Normal`](EntryType::Normal) and
+    /// [`Compressed`](EntryType::Compressed)) and the free-list entries
+    /// ([`Free`](EntryType::Free), §7.5.4), after merging the `/Prev`
+    /// chain with newest-revision-wins precedence (§7.5.6). To take only
+    /// the in-use entries, filter with
+    /// `!matches!(e, EntryType::Free { .. })`.
+    ///
+    /// Ordering is unspecified: it does not follow file order and must
+    /// not be relied upon.
     pub fn entries(&self) -> Vec<(ObjectIdentifier, EntryType)> {
         match &self.0 {
             Inner::Dummy => Vec::new(),
@@ -481,17 +502,31 @@ impl XRef {
         }
     }
 
-    /// Return the trailer dictionary of the first-page xref section in
-    /// a linearized document.
+    /// Return the trailer dictionary immediately preceding the first
+    /// `%%EOF` marker in the file — the last `trailer` keyword before
+    /// that marker.
     ///
-    /// Returns `None` for non-linearized documents, for dummy xrefs, or
-    /// when the first-page trailer cannot be located. The first-page
-    /// trailer is the dict immediately preceding the first `%%EOF`
-    /// marker in the file (ISO 32000-2 Annex F.3.4, "First-page
-    /// cross-reference table and trailer").
+    /// In a linearized document this is the first-page trailer, which
+    /// sits below the first-page cross-reference table ahead of the
+    /// leading `%%EOF` (ISO 32000-2 Annex F.3.4, "First-page
+    /// cross-reference table and trailer (Part 3)"); use
+    /// [`Pdf::is_linearized`] to recognise that case.
+    ///
+    /// A non-linearized document may still carry several `%%EOF`
+    /// markers: each incremental update appends its own trailer
+    /// terminated by its own `%%EOF` (ISO 32000-1 §7.5.6). This method
+    /// always returns the trailer preceding the **first** `%%EOF` — the
+    /// original/oldest revision's trailer — so for an incrementally
+    /// updated file it is **not** the same dict as [`XRef::trailer`],
+    /// which follows the final `startxref` to the newest revision.
+    ///
+    /// Returns `None` for dummy xrefs, or when no `%%EOF` or preceding
+    /// `trailer` keyword can be located.
     ///
     /// Requires the `inspect` feature because it uses `FileLayout`
     /// EOF offsets.
+    ///
+    /// [`Pdf::is_linearized`]: crate::Pdf::is_linearized
     #[cfg(feature = "inspect")]
     pub fn first_page_trailer(&self) -> Option<Dict<'_>> {
         let repr = match &self.0 {
@@ -597,6 +632,16 @@ impl XRef {
     /// O(chain length) and allocates one `Vec`. Consumers should bind
     /// the result once.
     ///
+    /// # Tolerance
+    ///
+    /// Each `startxref` / `/Prev` offset is required to point exactly at
+    /// the `xref` keyword or the xref-stream object header. Unlike the
+    /// recovery-oriented production parser (which does
+    /// `skip_white_spaces_and_comments` before dispatching), section
+    /// discovery does not skip leading whitespace or comments, so a
+    /// section whose offset lands on such bytes is not reported.
+    /// Well-formed files point exactly at the keyword/header.
+    ///
     /// Requires the `inspect` feature.
     #[cfg(feature = "inspect")]
     pub fn sections(&self) -> Vec<XRefSection> {
@@ -665,8 +710,20 @@ impl XRef {
 
     /// Return the logical size of the cross-reference table.
     ///
-    /// This is the trailer's `/Size` value when present, falling back to
-    /// the highest observed object number plus one.
+    /// This is the maximum of the trailer's `/Size` (when present as a
+    /// valid integer) and the highest observed object number plus one,
+    /// and so is never less than either. The two coincide on a
+    /// well-formed file — ISO 32000-1 §7.5.5 defines `/Size` as one
+    /// greater than the highest object number — but a stale `/Size` from
+    /// an incremental update, or a fallback scan that recovers objects
+    /// beyond `/Size`, can make the map-derived value larger, in which
+    /// case it wins. The object-number arithmetic saturates, so a
+    /// crafted maximal object number cannot overflow `i32`.
+    ///
+    /// # Performance
+    ///
+    /// Recomputed on each call (reads the trailer and scans the entry
+    /// map); bind the result if calling repeatedly.
     pub fn size(&self) -> i32 {
         let from_trailer: Option<i32> = self.trailer().and_then(|t| t.get::<i32>(SIZE));
         let from_map: i32 = match &self.0 {
@@ -2142,6 +2199,11 @@ pub enum XRefKind {
 /// used (§7.5.6). Returned by [`XRef::sections`] in
 /// `startxref → /Prev` walk order (most-recent-first).
 ///
+/// A hybrid-reference file (§7.5.8.4) is a classic [`XRefKind::Table`]
+/// section whose [`xref_stm`](Self::xref_stm) names a companion
+/// cross-reference stream; that offset is carried here rather than
+/// emitted as a separate section.
+///
 /// Requires the `inspect` feature.
 #[cfg(feature = "inspect")]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2162,6 +2224,10 @@ pub struct XRefSection {
     /// after the trailer dict for `Table`, or after `endobj` for
     /// `Stream`.
     pub end_offset: usize,
+    /// For a hybrid-reference file (§7.5.8.4): the byte offset of the
+    /// cross-reference stream named by this classic table's `/XRefStm`
+    /// entry. `None` for a pure classic table or an xref-stream section.
+    pub xref_stm: Option<usize>,
 }
 
 /// Walk the `startxref` + `/Prev` chain starting at `pos`, collecting
@@ -2225,9 +2291,11 @@ fn scan_table_section(data: &[u8], pos: usize) -> Option<(XRefSection, Option<us
         let header_end = reader.offset();
         subsection_headers.push(header_start..header_end);
 
-        // Skip the entry rows for this subsection.
-        let rows_len = XREF_ENTRY_LEN * header.num_entries as usize;
-        reader.jump(reader.offset() + rows_len);
+        // Skip the entry rows for this subsection. Checked arithmetic
+        // (mirroring `read_xref_table_trailer`) so an absurd `num_entries`
+        // cannot overflow `usize` on a 32-bit target.
+        let rows_len = XREF_ENTRY_LEN.checked_mul(header.num_entries as usize)?;
+        reader.jump(reader.offset().checked_add(rows_len)?);
     }
 
     reader.skip_white_spaces();
@@ -2238,9 +2306,13 @@ fn scan_table_section(data: &[u8], pos: usize) -> Option<(XRefSection, Option<us
     let trailer_dict = reader.read_with_context::<Dict<'_>>(&ReaderContext::dummy())?;
     let trailer_end = trailer_start + trailer_dict.data().len();
 
-    let prev = trailer_dict
-        .get::<i32>(PREV)
-        .and_then(|p| if p >= 0 { Some(p as usize) } else { None });
+    let non_negative_offset = |p: i32| if p >= 0 { Some(p as usize) } else { None };
+    let prev = trailer_dict.get::<i32>(PREV).and_then(non_negative_offset);
+    // Hybrid-reference file (§7.5.8.4): a classic table whose trailer names
+    // a companion cross-reference stream via `/XRefStm`.
+    let xref_stm = trailer_dict
+        .get::<i32>(XREF_STM)
+        .and_then(non_negative_offset);
 
     Some((
         XRefSection {
@@ -2249,6 +2321,7 @@ fn scan_table_section(data: &[u8], pos: usize) -> Option<(XRefSection, Option<us
             subsection_headers,
             keyword_offset: pos,
             end_offset: trailer_end,
+            xref_stm,
         },
         prev,
     ))
@@ -2278,6 +2351,9 @@ fn scan_stream_section(data: &[u8], pos: usize) -> Option<(XRefSection, Option<u
             subsection_headers: Vec::new(),
             keyword_offset: pos,
             end_offset,
+            // A cross-reference stream carries its `/Prev` directly; the
+            // `/XRefStm` compatibility pointer is a classic-table concept.
+            xref_stm: None,
         },
         prev,
     ))
@@ -2768,6 +2844,35 @@ mod tests {
     }
 
     #[test]
+    fn size_prefers_map_max_over_stale_trailer_size() {
+        // The trailer understates the table: /Size is 2, yet the xref
+        // declares objects 0..2 with object 2 in use. Per ISO 32000-1
+        // §7.5.5, /Size shall be one greater than the highest object
+        // number (here 3); a stale value must not shrink the reported
+        // size, so `size()` returns max(/Size, highest_obj + 1) = 3.
+        let catalog = "<< /Type /Catalog /Pages 2 0 R >>";
+        let pages = "<< /Type /Pages /Kids [] /Count 0 >>";
+
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.7\n");
+        let off1 = pdf.len();
+        pdf.extend_from_slice(format!("1 0 obj\n{catalog}\nendobj\n").as_bytes());
+        let off2 = pdf.len();
+        pdf.extend_from_slice(format!("2 0 obj\n{pages}\nendobj\n").as_bytes());
+
+        let xref_pos = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 3\n");
+        pdf.extend_from_slice(b"0000000000 65535 f \n"); // obj 0 free head
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes()); // obj 1 in use
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes()); // obj 2 in use
+        pdf.extend_from_slice(b"trailer\n<< /Size 2 /Root 1 0 R >>\n"); // stale /Size
+        pdf.extend_from_slice(format!("startxref\n{xref_pos}\n%%EOF").as_bytes());
+
+        let pdf = Pdf::new(pdf).expect("pdf loads");
+        assert_eq!(pdf.xref().size(), 3);
+    }
+
+    #[test]
     fn entry_returns_none_for_unknown_id() {
         let (bytes, _, _) = build_pdf_with_free_list();
         let pdf = Pdf::new(bytes).expect("pdf loads");
@@ -2801,6 +2906,8 @@ mod tests {
         assert!(!sections[0].subsection_headers.is_empty());
         assert!(sections[0].end_offset > sections[0].offset);
         assert_eq!(sections[0].keyword_offset, sections[0].offset);
+        // A pure classic table carries no companion xref stream.
+        assert_eq!(sections[0].xref_stm, None);
     }
 
     #[cfg(feature = "inspect")]
@@ -2893,6 +3000,28 @@ mod tests {
         );
         assert_eq!(sections[0].kind, XRefKind::Table);
         assert_eq!(sections[1].kind, XRefKind::Table);
+    }
+
+    #[cfg(feature = "inspect")]
+    #[test]
+    fn sections_represent_hybrid_xref_stm() {
+        // Hybrid-reference file (§7.5.8.4): classic tables whose trailers
+        // carry /XRefStm pointing at a cross-reference stream. sections()
+        // must surface that offset so the hybrid structure is visible.
+        let (pdf, _) = shared_xref_stm_revisions_fixture();
+        let file_len = pdf.len();
+        let pdf_doc = Pdf::new(pdf).expect("two-revision hybrid loads");
+        let sections = pdf_doc.xref().sections();
+        assert_eq!(sections.len(), 2, "{sections:?}");
+        for section in &sections {
+            assert_eq!(section.kind, XRefKind::Table);
+            let stm = section
+                .xref_stm
+                .expect("hybrid classic table must carry /XRefStm");
+            assert!(stm < file_len, "xref_stm offset must be within the file");
+        }
+        // Both revisions re-publish the SAME shared /XRefStm.
+        assert_eq!(sections[0].xref_stm, sections[1].xref_stm);
     }
 
     // --- PR #9: indirect layout -----------------------------------------
