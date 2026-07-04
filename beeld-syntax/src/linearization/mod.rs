@@ -745,9 +745,8 @@ mod tests {
     /// (design §7.7) against a genuine linearizer with a non-empty section.
     #[test]
     fn hint_tables_decode_non_empty_shared_section() {
-        let bytes: &[u8] = include_bytes!(
-            "../../../beeld-tests/pdfs/custom/font_truetype_slow_post_lookup.pdf"
-        );
+        let bytes: &[u8] =
+            include_bytes!("../../../beeld-tests/pdfs/custom/font_truetype_slow_post_lookup.pdf");
         let pdf = Pdf::new(bytes.to_vec()).expect("linearized fixture loads");
         assert!(pdf.is_genuinely_linearized()); // /L == file length == 69778
         let tables = pdf.hint_tables().expect("hint tables decode");
@@ -756,17 +755,6 @@ mod tests {
         // One page-offset entry per page (/N == 7); page 0 shares nothing.
         assert_eq!(lin.page_count, 7);
         assert_eq!(tables.page_offset.pages.len(), 7);
-        panic!(
-            "DEBUG hdr={:?} S={:?} pages={:?}",
-            tables.page_offset.header,
-            pdf.hint_tables().map(|t| &t.shared.header),
-            tables
-                .page_offset
-                .pages
-                .iter()
-                .map(|p| (p.object_count, p.page_length, p.shared_refs.len()))
-                .collect::<Vec<_>>(),
-        );
 
         // The shared section is genuinely non-empty: 20 first-page groups and 6
         // shared-section groups, all 26 decoded as one column-major block.
@@ -776,7 +764,10 @@ mod tests {
 
         // page 0's first object is /O (251); its byte range ends at /E (13923),
         // cross-checking the F.4.1 adjustment and the page-0 length.
-        assert_eq!(tables.page_object_number(0, lin), Some(lin.first_page_object));
+        assert_eq!(
+            tables.page_object_number(0, lin),
+            Some(lin.first_page_object)
+        );
         assert_eq!(lin.first_page_object, 251);
         let range0 = tables.page_byte_range(0, lin).expect("page 0 range");
         assert_eq!(range0.end, lin.first_page_end_offset as u64);
