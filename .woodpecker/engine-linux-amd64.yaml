@@ -36,6 +36,12 @@ steps:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: "0"        # sccache cannot cache incremental compilation
       SCCACHE_CACHE_SIZE: 20G
+      # The svgraster dep is a private git.bloudraad.io repo; the commands rewrite
+      # its ssh:// URL to token-HTTPS with this read-only forge clone token so cargo
+      # (git-fetch-with-cli) can fetch it with no SSH key on the runner. Models the
+      # sdk repo (sdk/.woodpecker/ci-prelude.sh).
+      FORGE_CLONE_TOKEN:
+        from_secret: forge_clone_token
       # mise/binstall resolve tool versions and fetch prebuilts via the GitHub
       # API; authenticate to lift the shared unauthenticated (~60/hr) rate limit.
       GITHUB_TOKEN:
@@ -49,5 +55,8 @@ steps:
       - export CARGO_HOME="/cache/cargo/$${CI_REPO_NAME}"
       - export CARGO_TARGET_DIR="/cache/target/$${CI_REPO_NAME}/$${CI_WORKFLOW_NAME}"
       - export SCCACHE_DIR="/cache/sccache/$${CI_REPO_NAME}"
+      # Fetch the private svgraster git dep over token-HTTPS rather than ssh:// — no
+      # SSH key/host-key trust on the runner (models sdk/.woodpecker/ci-prelude.sh).
+      - git config --global url."https://oauth2:$${FORGE_CLONE_TOKEN}@git.bloudraad.io/".insteadOf "ssh://git@git.bloudraad.io/"
       - mise trust --all
       - just ci-engine

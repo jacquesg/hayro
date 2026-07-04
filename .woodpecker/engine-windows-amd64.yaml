@@ -31,6 +31,11 @@ steps:
     pull: true
     environment:
       CARGO_TERM_COLOR: always
+      # The svgraster dep is a private git.bloudraad.io repo; win-gate.ps1 rewrites its
+      # ssh:// URL to token-HTTPS with this read-only forge clone token so cargo can
+      # fetch it with no SSH key on the runner.
+      FORGE_CLONE_TOKEN:
+        from_secret: forge_clone_token
       # mise's GitHub API calls (tool version checks) — lift the shared rate limit.
       GITHUB_TOKEN:
         from_secret: github_token

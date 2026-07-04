@@ -46,6 +46,9 @@ steps:
   - name: engine
     image: bash
     environment:
+      # Private svgraster dep — token-HTTPS rewrite in the commands (see amd64 gate).
+      FORGE_CLONE_TOKEN:
+        from_secret: forge_clone_token
       # mise's GitHub API calls (tool metadata/version/download) — lift the shared
       # unauthenticated rate limit.
       GITHUB_TOKEN:
@@ -57,6 +60,11 @@ steps:
       - |
         set -e
         cd "$$(eval echo ~"$$(id -un)")/woodpecker-cache/src/$${CI_REPO_NAME:-beeld}"
+        # Fetch the private svgraster git dep over token-HTTPS rather than ssh:// (no
+        # SSH key on the runner). The local backend shares $HOME across workflows, so
+        # clear any stale lock a killed run left before writing --global.
+        rm -f "$${HOME}/.gitconfig.lock" 2>/dev/null || true
+        git config --global url."https://oauth2:$${FORGE_CLONE_TOKEN}@git.bloudraad.io/".insteadOf "ssh://git@git.bloudraad.io/"
         mise trust --all
         mise install
         just ci-test

@@ -9,6 +9,14 @@ $ErrorActionPreference = 'Stop'
 # prefix so deeply-nested test-asset paths (assets/svgs) check out.
 & git config --global core.longpaths true
 
+# The svgraster dep is a private git.bloudraad.io repo. Rewrite its ssh:// URL to
+# token-authenticated HTTPS with the read-only forge clone token (step env) so cargo
+# (git-fetch-with-cli, .cargo/config.toml) fetches it with no SSH key on the runner.
+# Models sdk/.woodpecker/ci-prelude.sh. Build the config key as ONE argument —
+# PowerShell would mis-split the bash-style url."...".insteadOf form.
+$forgeKey = "url.https://oauth2:$($env:FORGE_CLONE_TOKEN)@git.bloudraad.io/.insteadOf"
+& git config --global $forgeKey "ssh://git@git.bloudraad.io/"
+
 # Activate the baked mise toolchain for the workspace config — without `mise
 # install`, `mise exec -- cargo` reports "cargo is not currently active" (the tools
 # are baked into the image, so this is fast). GITHUB_TOKEN (step env) authenticates
