@@ -46,7 +46,8 @@ steps:
   - name: engine
     image: bash
     environment:
-      # Private svgraster dep — token-HTTPS rewrite in the commands (see amd64 gate).
+      # Private git.bloudraad.io deps (svgraster, henog): ci-prelude.sh rewrites their
+      # ssh:// URLs to token-HTTPS with this read-only forge clone token.
       FORGE_CLONE_TOKEN:
         from_secret: forge_clone_token
       # mise's GitHub API calls (tool metadata/version/download) — lift the shared
@@ -54,23 +55,15 @@ steps:
       GITHUB_TOKEN:
         from_secret: github_token
     commands:
-      # Build from the PERSISTENT checkout, not the throwaway workspace, so cargo's
-      # target/ under ~/woodpecker-cache stays warm. Provision the mise toolchain,
-      # then run the tests (fmt/clippy/doc/deny run once on Linux).
+      # Build from the PERSISTENT checkout (not the throwaway workspace) so the caches
+      # under ~/woodpecker-cache stay warm, then source the shared cache-env and run the
+      # prelude, exactly as the sdk gates do. ci-cache-env.sh restores HOME + prepends the
+      # mise tool bin dirs to PATH on the local backend (so `mise exec -- cargo` resolves)
+      # and redirects the caches; ci-prelude.sh then does the ssh->https forge auth
+      # (git config --global, now landing in the restored HOME cargo reads) + mise install.
       - |
         set -e
         cd "$$(eval echo ~"$$(id -un)")/woodpecker-cache/src/$${CI_REPO_NAME:-beeld}"
-        # Fetch the private git.bloudraad.io deps (svgraster, henog) over token-HTTPS
-        # instead of ssh:// — no SSH key on the runner. Inject the rewrite via git's
-        # env-var config (GIT_CONFIG_*): every git invocation honours it regardless of
-        # $HOME, and cargo's git-fetch-with-cli subprocess inherits it. `git config
-        # --global` is unreliable on the LOCAL backend (unlike the docker gates) — it and
-        # `mise exec` resolve $HOME differently so the rewrite goes unseen and the fetch
-        # hangs on ssh, and pinning HOME to the passwd home moves mise's toolchain lookup
-        # off cargo on this agent.
-        export GIT_CONFIG_COUNT=1
-        export GIT_CONFIG_KEY_0="url.https://oauth2:$${FORGE_CLONE_TOKEN}@git.bloudraad.io/.insteadOf"
-        export GIT_CONFIG_VALUE_0="ssh://git@git.bloudraad.io/"
-        mise trust --all
-        mise install
+        . scripts/ci-cache-env.sh
+        bash .woodpecker/ci-prelude.sh
         just ci-test
