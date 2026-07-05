@@ -59,19 +59,18 @@ steps:
       # then run the tests (fmt/clippy/doc/deny run once on Linux).
       - |
         set -e
-        # The local backend points HOME at a per-pipeline temp dir, but the
-        # `git config --global` below must land in the SAME home cargo's git subprocess
-        # reads, or the ssh->https rewrite is invisible and the private-dep fetch hangs on
-        # ssh. Restore HOME from the passwd db first (as sdk/scripts/ci-cache-env.sh does;
-        # rustup needs it too). CARGO_HOME then defaults under it, so the git-dep clone
-        # cache also persists.
-        export HOME="$$(eval echo ~"$$(id -un)")"
-        cd "$${HOME}/woodpecker-cache/src/$${CI_REPO_NAME:-beeld}"
+        cd "$$(eval echo ~"$$(id -un)")/woodpecker-cache/src/$${CI_REPO_NAME:-beeld}"
         # Fetch the private git.bloudraad.io deps (svgraster, henog) over token-HTTPS
-        # rather than ssh:// — no SSH key on the runner. Clear any stale global-config
-        # lock a killed run left before writing --global.
-        rm -f "$${HOME}/.gitconfig.lock" 2>/dev/null || true
-        git config --global url."https://oauth2:$${FORGE_CLONE_TOKEN}@git.bloudraad.io/".insteadOf "ssh://git@git.bloudraad.io/"
+        # instead of ssh:// — no SSH key on the runner. Inject the rewrite via git's
+        # env-var config (GIT_CONFIG_*): every git invocation honours it regardless of
+        # $HOME, and cargo's git-fetch-with-cli subprocess inherits it. `git config
+        # --global` is unreliable on the LOCAL backend (unlike the docker gates) — it and
+        # `mise exec` resolve $HOME differently so the rewrite goes unseen and the fetch
+        # hangs on ssh, and pinning HOME to the passwd home moves mise's toolchain lookup
+        # off cargo on this agent.
+        export GIT_CONFIG_COUNT=1
+        export GIT_CONFIG_KEY_0="url.https://oauth2:$${FORGE_CLONE_TOKEN}@git.bloudraad.io/.insteadOf"
+        export GIT_CONFIG_VALUE_0="ssh://git@git.bloudraad.io/"
         mise trust --all
         mise install
         just ci-test
