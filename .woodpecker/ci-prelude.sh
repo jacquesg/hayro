@@ -21,3 +21,12 @@ rm -f "${HOME}/.gitconfig.lock" 2>/dev/null || true
 git config --global url."https://oauth2:${FORGE_CLONE_TOKEN}@git.bloudraad.io/".insteadOf "ssh://git@git.bloudraad.io/"
 mise trust --all
 mise install
+# Repair a half-written toolchain a killed `mise install` may have left. This darwin local
+# backend shares ONE ~/.local/share/mise across every repo's gate, and mise provisions rust
+# via rustup: installs/rust/<v>/bin/cargo is a symlink to the bundled rustup proxy. An
+# interrupted reinstall can leave that proxy (or bin/rustup) gone while mise still records
+# rust as "installed" -- so the `mise install` above no-ops and never repairs it, and every
+# subsequent `mise exec -- cargo` dies with "couldn't exec process: No such file or
+# directory". Execing cargo costs milliseconds on a healthy toolchain (a no-op); when it
+# fails, force a clean rust reinstall so the gate self-heals instead of failing cryptically.
+mise exec -- cargo --version >/dev/null 2>&1 || mise install --force rust
